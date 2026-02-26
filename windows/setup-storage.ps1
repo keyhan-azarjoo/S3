@@ -192,10 +192,10 @@ function Normalize-HostInput([string]$raw) {
   return $value
 }
 
-function Test-TcpPort([string]$host, [int]$port, [int]$timeoutMs = 1500) {
+function Test-TcpPort([string]$targetHost, [int]$port, [int]$timeoutMs = 1500) {
   $client = New-Object System.Net.Sockets.TcpClient
   try {
-    $ar = $client.BeginConnect($host, $port, $null, $null)
+    $ar = $client.BeginConnect($targetHost, $port, $null, $null)
     if (-not $ar.AsyncWaitHandle.WaitOne($timeoutMs, $false)) {
       $client.Close()
       return $false
@@ -209,10 +209,10 @@ function Test-TcpPort([string]$host, [int]$port, [int]$timeoutMs = 1500) {
   }
 }
 
-function Wait-TcpPort([string]$host, [int]$port, [int]$maxSeconds = 30) {
+function Wait-TcpPort([string]$targetHost, [int]$port, [int]$maxSeconds = 30) {
   $elapsed = 0
   while ($elapsed -lt $maxSeconds) {
-    if (Test-TcpPort -host $host -port $port) { return $true }
+    if (Test-TcpPort -targetHost $targetHost -port $port) { return $true }
     Start-Sleep -Seconds 1
     $elapsed += 1
   }
@@ -359,7 +359,7 @@ function Ensure-MinIONative([string]$root,[int]$apiPort,[int]$uiPort) {
   }
   $ErrorActionPreference = $prev
 
-  if (-not (Wait-TcpPort -host "127.0.0.1" -port $uiPort -maxSeconds 45)) {
+  if (-not (Wait-TcpPort -targetHost "127.0.0.1" -port $uiPort -maxSeconds 45)) {
     Warn "MinIO console port $uiPort did not become ready in time."
     Warn "Task status:"
     schtasks /Query /TN $taskName /V /FO LIST 2>$null | Out-String | Write-Host
@@ -426,7 +426,7 @@ function Ensure-IISProxyMode([string]$domain,[string]$siteRoot,[string]$certPath
   Start-Website -Name "LocalS3-IIS" 2>$null | Out-Null
   $ErrorActionPreference = "Stop"
 
-  if (-not (Wait-TcpPort -host "127.0.0.1" -port $httpsPort -maxSeconds 30)) {
+  if (-not (Wait-TcpPort -targetHost "127.0.0.1" -port $httpsPort -maxSeconds 30)) {
     Err "IIS HTTPS listener on port $httpsPort is not reachable."
     Warn "IIS site state:"
     Get-Website -Name "LocalS3-IIS" | Format-List * | Out-String | Write-Host
