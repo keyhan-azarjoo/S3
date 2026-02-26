@@ -203,17 +203,82 @@ function Ask-InstallMode {
 }
 
 function Ensure-IISInstalled {
-  $root = Split-Path -Parent $PSCommandPath
-  $installer = Join-Path $root "installers\install-iis-prereqs.ps1"
-  if (-not (Test-Path $installer)) {
-    Err "IIS installer script not found: $installer"
-    exit 1
+  Info "Checking/Installing IIS prerequisites..."
+
+  function Ensure-FeatureLocal([string]$name) {
+    $f = Get-WindowsOptionalFeature -Online -FeatureName $name -ErrorAction SilentlyContinue
+    if ($f -and $f.State -eq "Enabled") { return }
+    Info "Enabling Windows feature: $name"
+    dism /online /enable-feature /featurename:$name /all /norestart | Out-Null
   }
-  Info "Running IIS prerequisites installer..."
-  & powershell -NoProfile -ExecutionPolicy Bypass -File $installer
-  if ($LASTEXITCODE -ne 0) {
-    Err "IIS prerequisites installation failed."
-    exit 1
+
+  function Is-AppInstalledLocal([string]$displayNamePattern) {
+    $paths = @(
+      "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\*",
+      "HKLM:\SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall\*"
+    )
+    foreach ($p in $paths) {
+      $apps = Get-ItemProperty -Path $p -ErrorAction SilentlyContinue
+      if ($apps | Where-Object { $_.DisplayName -match $displayNamePattern }) { return $true }
+    }
+    return $false
+  }
+
+  function Install-MsiFromUrlsLocal([string[]]$urls, [string]$outFile) {
+    New-Item -ItemType Directory -Force -Path (Split-Path -Parent $outFile) | Out-Null
+    foreach ($url in $urls) {
+      try {
+        Info "Downloading: $url"
+        Invoke-WebRequest -Uri $url -OutFile $outFile
+        if ((Test-Path $outFile) -and ((Get-Item $outFile).Length -gt 1000000)) {
+          Info "Installing: $outFile"
+          Start-Process -FilePath "msiexec.exe" -ArgumentList @("/i","`"$outFile`"","/qn","/norestart") -Wait
+          return $true
+        }
+      } catch {
+        Warn "Failed from URL: $url"
+      }
+    }
+    return $false
+  }
+
+  $features = @(
+    "IIS-WebServerRole","IIS-WebServer","IIS-CommonHttpFeatures","IIS-DefaultDocument",
+    "IIS-StaticContent","IIS-HttpErrors","IIS-HttpRedirect","IIS-ApplicationDevelopment",
+    "IIS-ISAPIExtensions","IIS-ISAPIFilter","IIS-ManagementConsole"
+  )
+  foreach ($f in $features) { Ensure-FeatureLocal $f }
+
+  $dlDir = Join-Path $env:ProgramData "LocalS3\downloads"
+  $rewriteMsi = Join-Path $dlDir "rewrite_amd64_en-US.msi"
+  $arrMsi = Join-Path $dlDir "requestRouter_x64.msi"
+
+  if (-not (Is-AppInstalledLocal "IIS URL Rewrite")) {
+    Info "IIS URL Rewrite not found. Installing..."
+    $rewriteUrls = @(
+      "https://download.microsoft.com/download/1/2/8/128E2E22-C1B9-44A4-BE2A-5859ED1D4592/rewrite_amd64_en-US.msi",
+      "https://raw.githubusercontent.com/keyhan-azarjoo/S3/main/windows/installers/rewrite_amd64_en-US.msi"
+    )
+    if (-not (Install-MsiFromUrlsLocal -urls $rewriteUrls -outFile $rewriteMsi)) {
+      Err "Failed to install IIS URL Rewrite automatically."
+      exit 1
+    }
+  } else {
+    Info "IIS URL Rewrite already installed."
+  }
+
+  if (-not (Is-AppInstalledLocal "Application Request Routing")) {
+    Info "IIS ARR not found. Installing..."
+    $arrUrls = @(
+      "https://go.microsoft.com/fwlink/?LinkID=615136",
+      "https://raw.githubusercontent.com/keyhan-azarjoo/S3/main/windows/installers/requestRouter_x64.msi"
+    )
+    if (-not (Install-MsiFromUrlsLocal -urls $arrUrls -outFile $arrMsi)) {
+      Err "Failed to install IIS ARR automatically."
+      exit 1
+    }
+  } else {
+    Info "IIS ARR already installed."
   }
 }
 
