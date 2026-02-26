@@ -192,6 +192,33 @@ function Normalize-HostInput([string]$raw) {
   return $value
 }
 
+function Test-TcpPort([string]$host, [int]$port, [int]$timeoutMs = 1500) {
+  $client = New-Object System.Net.Sockets.TcpClient
+  try {
+    $ar = $client.BeginConnect($host, $port, $null, $null)
+    if (-not $ar.AsyncWaitHandle.WaitOne($timeoutMs, $false)) {
+      $client.Close()
+      return $false
+    }
+    $client.EndConnect($ar) | Out-Null
+    $client.Close()
+    return $true
+  } catch {
+    try { $client.Close() } catch {}
+    return $false
+  }
+}
+
+function Wait-TcpPort([string]$host, [int]$port, [int]$maxSeconds = 30) {
+  $elapsed = 0
+  while ($elapsed -lt $maxSeconds) {
+    if (Test-TcpPort -host $host -port $port) { return $true }
+    Start-Sleep -Seconds 1
+    $elapsed += 1
+  }
+  return $false
+}
+
 function Ask-InstallMode {
   Write-Host ""
   Write-Host "Choose installation mode:"
@@ -331,6 +358,14 @@ function Ensure-MinIONative([string]$root,[int]$apiPort,[int]$uiPort) {
     Warn "MinIO task created but could not be started immediately. It will run at next startup."
   }
   $ErrorActionPreference = $prev
+
+  if (-not (Wait-TcpPort -host "127.0.0.1" -port $uiPort -maxSeconds 45)) {
+    Warn "MinIO console port $uiPort did not become ready in time."
+    Warn "Task status:"
+    schtasks /Query /TN $taskName /V /FO LIST 2>$null | Out-String | Write-Host
+    Err "MinIO service is not reachable yet. Fix MinIO startup and rerun."
+    exit 1
+  }
 }
 
 function Ensure-IISProxyMode([string]$domain,[string]$siteRoot,[string]$certPath,[string]$keyPath,[int]$httpsPort,[int]$targetPort,[string]$lanIp) {
@@ -375,8 +410,32 @@ function Ensure-IISProxyMode([string]$domain,[string]$siteRoot,[string]$certPath
   New-WebBinding -Name "LocalS3-IIS" -Protocol "https" -Port $httpsPort -IPAddress "*" -HostHeader $domain -SslFlags 1 | Out-Null
   (Get-WebBinding -Name "LocalS3-IIS" -Protocol https -Port $httpsPort -HostHeader $domain).AddSslCertificate($thumb,"My")
 
+  # Add direct LAN-IP binding so https://<LAN-IP> works from other computers.
+  if ($lanIp) {
+    $ipBindingInfo = "$lanIp`:$httpsPort`:"
+    $ipBinding = Get-WebBinding -Name "LocalS3-IIS" -Protocol https | Where-Object { $_.bindingInformation -eq $ipBindingInfo }
+    if (-not $ipBinding) {
+      New-WebBinding -Name "LocalS3-IIS" -Protocol "https" -Port $httpsPort -IPAddress $lanIp -HostHeader "" -SslFlags 0 | Out-Null
+      $ipBinding = Get-WebBinding -Name "LocalS3-IIS" -Protocol https | Where-Object { $_.bindingInformation -eq $ipBindingInfo } | Select-Object -First 1
+      if ($ipBinding) { $ipBinding.AddSslCertificate($thumb,"My") }
+    }
+  }
+
+  $ErrorActionPreference = "Continue"
+  Start-Service W3SVC 2>$null | Out-Null
+  Start-Website -Name "LocalS3-IIS" 2>$null | Out-Null
+  $ErrorActionPreference = "Stop"
+
+  if (-not (Wait-TcpPort -host "127.0.0.1" -port $httpsPort -maxSeconds 30)) {
+    Err "IIS HTTPS listener on port $httpsPort is not reachable."
+    Warn "IIS site state:"
+    Get-Website -Name "LocalS3-IIS" | Format-List * | Out-String | Write-Host
+    Warn "Check if another app is blocking port $httpsPort."
+    exit 1
+  }
+
   if ($domain -ne "localhost") { Ensure-HostsEntry -domain $domain }
-  if ($lanIp) { Ensure-FirewallPort443 }
+  if ($lanIp) { Ensure-FirewallPort -port $httpsPort }
 }
 
 function Install-IISMode {
@@ -705,16 +764,16 @@ function Get-LanIPv4 {
   }
 }
 
-function Ensure-FirewallPort443 {
-  $ruleName = "Local S3 HTTPS 443"
+function Ensure-FirewallPort([int]$port) {
+  $ruleName = "Local S3 HTTPS $port"
   $rule = Get-NetFirewallRule -DisplayName $ruleName -ErrorAction SilentlyContinue
   if ($rule) {
     Info "Firewall rule already exists: $ruleName"
     return
   }
 
-  Info "Opening Windows Firewall inbound TCP 443..."
-  New-NetFirewallRule -DisplayName $ruleName -Direction Inbound -Action Allow -Protocol TCP -LocalPort 443 | Out-Null
+  Info "Opening Windows Firewall inbound TCP $port..."
+  New-NetFirewallRule -DisplayName $ruleName -Direction Inbound -Action Allow -Protocol TCP -LocalPort $port | Out-Null
 }
 
 function Ensure-HostsEntry([string]$domain) {
@@ -837,7 +896,7 @@ function Write-FilesAndUp {
     } else {
       Info "Detected LAN IP: $lanIp"
     }
-    Ensure-FirewallPort443
+    Ensure-FirewallPort -port 443
   }
 
   # Resolve Docker context early so we can clean up previous installer containers if needed.
@@ -875,6 +934,7 @@ function Write-FilesAndUp {
   }
   if (-not $minioApi)  { Err "No free port for MinIO API (9000/19000/29000)."; exit 1 }
   if (-not $minioUI)   { Err "No free port for MinIO UI (9001/19001/29001)."; exit 1 }
+  if ($enableLan) { Ensure-FirewallPort -port $nginxHttps }
 
   Info "Using ports:"
   Info " - Nginx HTTPS: $nginxHttps"
