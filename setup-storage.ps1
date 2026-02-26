@@ -46,6 +46,67 @@ function Register-ResumeAfterReboot {
   }
 }
 
+function Download-FileFast([string[]]$urls, [string]$outFile) {
+  $outDir = Split-Path -Parent $outFile
+  New-Item -ItemType Directory -Force -Path $outDir | Out-Null
+
+  foreach ($u in $urls) {
+    try {
+      if (Has-Cmd "curl.exe") {
+        Info "Downloading with curl (resume supported)..."
+        & curl.exe -L --fail --retry 4 --retry-delay 2 --connect-timeout 20 -C - -o $outFile $u
+        if ($LASTEXITCODE -eq 0 -and (Test-Path $outFile) -and ((Get-Item $outFile).Length -gt 104857600)) { return $true }
+      }
+    } catch {}
+
+    try {
+      if (Get-Command Start-BitsTransfer -ErrorAction SilentlyContinue) {
+        Info "Downloading with BITS..."
+        Start-BitsTransfer -Source $u -Destination $outFile -DisplayName "DockerDesktopInstaller"
+        if ((Test-Path $outFile) -and ((Get-Item $outFile).Length -gt 104857600)) { return $true }
+      }
+    } catch {}
+
+    try {
+      Info "Downloading with Invoke-WebRequest..."
+      Invoke-WebRequest -Uri $u -OutFile $outFile
+      if ((Test-Path $outFile) -and ((Get-Item $outFile).Length -gt 104857600)) { return $true }
+    } catch {}
+  }
+
+  return $false
+}
+
+function Install-DockerDesktopDirect {
+  $cacheDir = Join-Path $env:ProgramData "LocalS3\downloads"
+  $exe = Join-Path $cacheDir "DockerDesktopInstaller.exe"
+  $urls = @(
+    "https://desktop.docker.com/win/main/amd64/Docker%20Desktop%20Installer.exe",
+    "https://desktop.docker.com/win/stable/amd64/Docker%20Desktop%20Installer.exe"
+  )
+
+  $useCached = $false
+  if (Test-Path $exe) {
+    $size = (Get-Item $exe).Length
+    if ($size -gt 104857600) {
+      $useCached = $true
+      Info "Using cached Docker installer: $exe"
+    }
+  }
+
+  if (-not $useCached) {
+    Info "Downloading Docker Desktop installer (this can take several minutes once)..."
+    $ok = Download-FileFast -urls $urls -outFile $exe
+    if (-not $ok) {
+      Err "Failed to download Docker Desktop installer."
+      return $false
+    }
+  }
+
+  Start-Process -FilePath $exe -ArgumentList @("install","--quiet","--accept-license") -Wait
+  return $true
+}
+
 function Normalize-HostInput([string]$raw) {
   if ([string]::IsNullOrWhiteSpace($raw)) { return "localhost" }
   $value = $raw.Trim()
@@ -137,11 +198,8 @@ function Ensure-DockerInstalled {
       winget install -e --id Docker.DockerDesktop --accept-source-agreements --accept-package-agreements | Out-Null
     } catch {
       Warn "winget install failed. Trying direct download installer..."
-      $dl = "https://desktop.docker.com/win/main/amd64/Docker%20Desktop%20Installer.exe"
-      $exe = Join-Path $env:TEMP "DockerDesktopInstaller.exe"
       try {
-        Invoke-WebRequest -Uri $dl -OutFile $exe
-        Start-Process -FilePath $exe -ArgumentList @("install","--quiet","--accept-license") -Wait
+        if (-not (Install-DockerDesktopDirect)) { throw "download/install failed" }
       } catch {
         Err "Docker Desktop install failed. Install manually, then rerun."
         exit 1
@@ -149,11 +207,8 @@ function Ensure-DockerInstalled {
     }
   } else {
     Info "winget not available. Installing Docker Desktop via direct download..."
-    $dl = "https://desktop.docker.com/win/main/amd64/Docker%20Desktop%20Installer.exe"
-    $exe = Join-Path $env:TEMP "DockerDesktopInstaller.exe"
     try {
-      Invoke-WebRequest -Uri $dl -OutFile $exe
-      Start-Process -FilePath $exe -ArgumentList @("install","--quiet","--accept-license") -Wait
+      if (-not (Install-DockerDesktopDirect)) { throw "download/install failed" }
     } catch {
       Err "Docker Desktop install failed. Install manually, then rerun."
       exit 1
