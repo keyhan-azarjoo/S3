@@ -36,11 +36,23 @@ Script reference:
 
 `https://github.com/keyhan-azarjoo/S3/blob/main/setup-storage.ps1`
 
+One-line run from GitHub (PowerShell):
+
+```powershell
+powershell -NoProfile -ExecutionPolicy Bypass -Command "Invoke-WebRequest -Uri 'https://raw.githubusercontent.com/keyhan-azarjoo/S3/main/setup-storage.ps1' -OutFile 'setup-storage.ps1'; .\setup-storage.ps1"
+```
+
 ## Linux/macOS Usage
 
 ```bash
 chmod +x setup-storage.sh
 ./setup-storage.sh
+```
+
+One-line run from GitHub (curl-style):
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/keyhan-azarjoo/S3/main/setup-storage.sh -o setup-storage.sh && chmod +x setup-storage.sh && sudo ./setup-storage.sh
 ```
 
 ## Access URLs
