@@ -33,6 +33,19 @@ function Has-Cmd($name){
   return [bool](Get-Command $name -ErrorAction SilentlyContinue)
 }
 
+function Register-ResumeAfterReboot {
+  try {
+    $scriptPath = (Resolve-Path -Path $PSCommandPath).Path
+    $runOncePath = "HKLM:\Software\Microsoft\Windows\CurrentVersion\RunOnce"
+    $cmd = "powershell -NoProfile -ExecutionPolicy Bypass -File `"$scriptPath`""
+    New-Item -Path $runOncePath -Force | Out-Null
+    New-ItemProperty -Path $runOncePath -Name "LocalS3SetupResume" -Value $cmd -PropertyType String -Force | Out-Null
+    Info "Installer will resume automatically after next reboot/sign-in."
+  } catch {
+    Warn "Could not register auto-resume after reboot. Run this script again manually after restart."
+  }
+}
+
 function Normalize-HostInput([string]$raw) {
   if ([string]::IsNullOrWhiteSpace($raw)) { return "localhost" }
   $value = $raw.Trim()
@@ -78,7 +91,15 @@ function Enable-WSLFeatures {
   }
 
   if ($needRestart) {
-    Warn "WSL2 features were enabled/updated. Please RESTART Windows, then run this script again."
+    Register-ResumeAfterReboot
+    Warn "WSL2 features were enabled/updated. A Windows restart is required."
+    $restartNow = (Read-Host "Restart now? (Y/n)").Trim().ToLowerInvariant()
+    if ($restartNow -eq "" -or $restartNow -eq "y" -or $restartNow -eq "yes") {
+      Warn "Restarting Windows now..."
+      shutdown /r /t 5
+    } else {
+      Warn "Please restart Windows manually, then the installer will auto-resume after sign-in."
+    }
     exit 0
   }
 
