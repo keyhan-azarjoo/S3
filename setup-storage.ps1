@@ -11,6 +11,8 @@ $ErrorActionPreference = "Stop"
 $Script:LocalS3Label = "com.locals3.installer=true"
 $Script:RestartRequired = $false
 $Script:RestartReasons = New-Object System.Collections.Generic.List[string]
+$Script:StateDir = Join-Path $env:ProgramData "LocalS3"
+$Script:RestartCountFile = Join-Path $Script:StateDir "restart-count.txt"
 
 function Info($m){ Write-Host "[INFO] $m" }
 function Warn($m){ Write-Host "[WARN] $m" -ForegroundColor Yellow }
@@ -48,27 +50,57 @@ function Register-ResumeAfterReboot {
   }
 }
 
+function Get-RestartCount {
+  try {
+    if (Test-Path $Script:RestartCountFile) {
+      return [int](Get-Content -Path $Script:RestartCountFile -ErrorAction Stop | Select-Object -First 1)
+    }
+  } catch {}
+  return 0
+}
+
+function Set-RestartCount([int]$count) {
+  try {
+    New-Item -ItemType Directory -Force -Path $Script:StateDir | Out-Null
+    Set-Content -Path $Script:RestartCountFile -Value "$count" -Encoding ASCII
+  } catch {}
+}
+
+function Reset-RestartCount {
+  try { Remove-Item -Path $Script:RestartCountFile -Force -ErrorAction SilentlyContinue } catch {}
+}
+
+function Try-EnableDockerCliFromDefaultPath {
+  if (Has-Cmd "docker") { return }
+  $dockerBin = "C:\Program Files\Docker\Docker\resources\bin"
+  $dockerExe = Join-Path $dockerBin "docker.exe"
+  if (Test-Path $dockerExe) {
+    if ($env:Path -notlike "*$dockerBin*") {
+      $env:Path = "$dockerBin;$env:Path"
+    }
+  }
+}
+
 function Mark-RestartRequired([string]$reason) {
   $Script:RestartRequired = $true
   if ($reason -and -not $Script:RestartReasons.Contains($reason)) {
     $Script:RestartReasons.Add($reason) | Out-Null
   }
-  Register-ResumeAfterReboot
 }
 
 function Finish-Or-Restart {
   if (-not $Script:RestartRequired) { return $false }
-  Warn "A restart is required to continue setup."
+  $count = Get-RestartCount
+  if ($count -ge 1) {
+    Warn "Restart already flagged once. Skipping any auto-restart to avoid loops."
+  }
+  Warn "A restart is required to continue setup, but auto-restart is disabled."
   if ($Script:RestartReasons.Count -gt 0) {
     Warn ("Reasons: " + ($Script:RestartReasons -join "; "))
   }
-  $restartNow = (Read-Host "Restart now once and auto-resume after sign-in? (Y/n)").Trim().ToLowerInvariant()
-  if ($restartNow -eq "" -or $restartNow -eq "y" -or $restartNow -eq "yes") {
-    Warn "Restarting Windows now..."
-    shutdown /r /t 5
-  } else {
-    Warn "Please restart Windows manually. Installer will auto-resume after sign-in."
-  }
+  Register-ResumeAfterReboot
+  Set-RestartCount ($count + 1)
+  Warn "Please restart Windows manually once, then sign in and the installer will auto-resume."
   return $true
 }
 
@@ -199,6 +231,7 @@ function Enable-WSLFeatures {
 
 function Ensure-DockerInstalled {
   Info "Checking Docker installation..."
+  Try-EnableDockerCliFromDefaultPath
   if (Has-Cmd "docker") {
     Info "Docker CLI found."
     return
@@ -234,6 +267,7 @@ function Ensure-DockerInstalled {
     }
   }
 
+  Try-EnableDockerCliFromDefaultPath
   if (-not (Has-Cmd "docker")) {
     Mark-RestartRequired "Docker Desktop installed (CLI not yet available in current session)"
     Warn "Docker Desktop install completed. Restart queued so setup can continue."
@@ -809,6 +843,7 @@ Ensure-DockerInstalled
 if (Finish-Or-Restart) { exit 0 }
 Sanitize-DockerEnv
 Wait-DockerEngine
+Reset-RestartCount
 Ensure-DockerCompose
 Write-FilesAndUp
 
