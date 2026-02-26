@@ -125,20 +125,50 @@ function Ensure-DockerInstalled {
   }
 
   Warn "Docker CLI not found."
-  if (-not (Has-Cmd "winget")) {
-    Err "winget is not available. Install Docker Desktop manually, then rerun."
+  $installNow = (Read-Host "Docker Desktop is required. Install automatically now? (Y/n)").Trim().ToLowerInvariant()
+  if ($installNow -ne "" -and $installNow -ne "y" -and $installNow -ne "yes") {
+    Err "Docker Desktop is required. Install it and rerun."
     exit 1
   }
 
-  Info "Installing Docker Desktop with winget..."
-  try {
-    winget install -e --id Docker.DockerDesktop --accept-source-agreements --accept-package-agreements | Out-Null
-  } catch {
-    Err "Docker Desktop install failed. Install Docker Desktop manually, then rerun."
-    exit 1
+  if (Has-Cmd "winget") {
+    Info "Installing Docker Desktop with winget..."
+    try {
+      winget install -e --id Docker.DockerDesktop --accept-source-agreements --accept-package-agreements | Out-Null
+    } catch {
+      Warn "winget install failed. Trying direct download installer..."
+      $dl = "https://desktop.docker.com/win/main/amd64/Docker%20Desktop%20Installer.exe"
+      $exe = Join-Path $env:TEMP "DockerDesktopInstaller.exe"
+      try {
+        Invoke-WebRequest -Uri $dl -OutFile $exe
+        Start-Process -FilePath $exe -ArgumentList @("install","--quiet","--accept-license") -Wait
+      } catch {
+        Err "Docker Desktop install failed. Install manually, then rerun."
+        exit 1
+      }
+    }
+  } else {
+    Info "winget not available. Installing Docker Desktop via direct download..."
+    $dl = "https://desktop.docker.com/win/main/amd64/Docker%20Desktop%20Installer.exe"
+    $exe = Join-Path $env:TEMP "DockerDesktopInstaller.exe"
+    try {
+      Invoke-WebRequest -Uri $dl -OutFile $exe
+      Start-Process -FilePath $exe -ArgumentList @("install","--quiet","--accept-license") -Wait
+    } catch {
+      Err "Docker Desktop install failed. Install manually, then rerun."
+      exit 1
+    }
   }
 
-  Warn "Docker Desktop installed. Please RESTART Windows, start Docker Desktop once, then rerun this script."
+  Register-ResumeAfterReboot
+  Warn "Docker Desktop installation finished."
+  $restartNow = (Read-Host "Restart now to complete Docker setup? (Y/n)").Trim().ToLowerInvariant()
+  if ($restartNow -eq "" -or $restartNow -eq "y" -or $restartNow -eq "yes") {
+    Warn "Restarting Windows now..."
+    shutdown /r /t 5
+  } else {
+    Warn "Please restart Windows manually. Installer will auto-resume after sign-in."
+  }
   exit 0
 }
 
