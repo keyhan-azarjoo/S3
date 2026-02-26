@@ -9,6 +9,8 @@
 
 $ErrorActionPreference = "Stop"
 $Script:LocalS3Label = "com.locals3.installer=true"
+$Script:RestartRequired = $false
+$Script:RestartReasons = New-Object System.Collections.Generic.List[string]
 
 function Info($m){ Write-Host "[INFO] $m" }
 function Warn($m){ Write-Host "[WARN] $m" -ForegroundColor Yellow }
@@ -44,6 +46,30 @@ function Register-ResumeAfterReboot {
   } catch {
     Warn "Could not register auto-resume after reboot. Run this script again manually after restart."
   }
+}
+
+function Mark-RestartRequired([string]$reason) {
+  $Script:RestartRequired = $true
+  if ($reason -and -not $Script:RestartReasons.Contains($reason)) {
+    $Script:RestartReasons.Add($reason) | Out-Null
+  }
+  Register-ResumeAfterReboot
+}
+
+function Finish-Or-Restart {
+  if (-not $Script:RestartRequired) { return $false }
+  Warn "A restart is required to continue setup."
+  if ($Script:RestartReasons.Count -gt 0) {
+    Warn ("Reasons: " + ($Script:RestartReasons -join "; "))
+  }
+  $restartNow = (Read-Host "Restart now once and auto-resume after sign-in? (Y/n)").Trim().ToLowerInvariant()
+  if ($restartNow -eq "" -or $restartNow -eq "y" -or $restartNow -eq "yes") {
+    Warn "Restarting Windows now..."
+    shutdown /r /t 5
+  } else {
+    Warn "Please restart Windows manually. Installer will auto-resume after sign-in."
+  }
+  return $true
 }
 
 function Download-FileFast([string[]]$urls, [string]$outFile) {
@@ -152,16 +178,9 @@ function Enable-WSLFeatures {
   }
 
   if ($needRestart) {
-    Register-ResumeAfterReboot
-    Warn "WSL2 features were enabled/updated. A Windows restart is required."
-    $restartNow = (Read-Host "Restart now? (Y/n)").Trim().ToLowerInvariant()
-    if ($restartNow -eq "" -or $restartNow -eq "y" -or $restartNow -eq "yes") {
-      Warn "Restarting Windows now..."
-      shutdown /r /t 5
-    } else {
-      Warn "Please restart Windows manually, then the installer will auto-resume after sign-in."
-    }
-    exit 0
+    Mark-RestartRequired "WSL2 features changed"
+    Warn "WSL2 changes queued. Setup will continue and restart once at the end if needed."
+    return
   }
 
   # Best-effort sanity
@@ -215,16 +234,12 @@ function Ensure-DockerInstalled {
     }
   }
 
-  Register-ResumeAfterReboot
-  Warn "Docker Desktop installation finished."
-  $restartNow = (Read-Host "Restart now to complete Docker setup? (Y/n)").Trim().ToLowerInvariant()
-  if ($restartNow -eq "" -or $restartNow -eq "y" -or $restartNow -eq "yes") {
-    Warn "Restarting Windows now..."
-    shutdown /r /t 5
-  } else {
-    Warn "Please restart Windows manually. Installer will auto-resume after sign-in."
+  if (-not (Has-Cmd "docker")) {
+    Mark-RestartRequired "Docker Desktop installed (CLI not yet available in current session)"
+    Warn "Docker Desktop install completed. Restart queued so setup can continue."
+    return
   }
-  exit 0
+  Warn "Docker Desktop installation finished. Continuing without immediate restart."
 }
 
 function Start-DockerDesktop {
@@ -791,6 +806,7 @@ Relaunch-Elevated
 Info "===== Local S3 Storage Installer (Windows) ====="
 Enable-WSLFeatures
 Ensure-DockerInstalled
+if (Finish-Or-Restart) { exit 0 }
 Sanitize-DockerEnv
 Wait-DockerEngine
 Ensure-DockerCompose
