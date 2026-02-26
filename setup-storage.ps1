@@ -94,13 +94,19 @@ function Finish-Or-Restart {
   if ($count -ge 1) {
     Warn "Restart already flagged once. Skipping any auto-restart to avoid loops."
   }
-  Warn "A restart is required to continue setup, but auto-restart is disabled."
+  Warn "A restart is required to continue setup."
   if ($Script:RestartReasons.Count -gt 0) {
     Warn ("Reasons: " + ($Script:RestartReasons -join "; "))
   }
   Register-ResumeAfterReboot
   Set-RestartCount ($count + 1)
-  Warn "Please restart Windows manually once, then sign in and the installer will auto-resume."
+  $restartNow = (Read-Host "Restart now? (Y/n)").Trim().ToLowerInvariant()
+  if ($restartNow -eq "" -or $restartNow -eq "y" -or $restartNow -eq "yes") {
+    Warn "Restarting Windows now..."
+    shutdown /r /t 5
+  } else {
+    Warn "Please restart Windows manually once, then sign in and the installer will auto-resume."
+  }
   return $true
 }
 
