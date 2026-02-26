@@ -789,7 +789,10 @@ function Resolve-HttpsPortForIIS {
     Warn "Port 443 is already in use."
   }
 
-  $choice = (Read-Host "Choose HTTPS port: 1) auto alternate 2) custom port (default: 1)").Trim()
+  Write-Host "Choose HTTPS port option:"
+  Write-Host "  1) Auto alternate port (tries: 8443, 9443, 10443, 11443, 12443)"
+  Write-Host "  2) Enter custom port"
+  $choice = (Read-Host "Select option [1/2] (default: 1)").Trim()
   if ($choice -eq "2") {
     return Resolve-RequiredPort -label "HTTPS (IIS)" -candidates @() -defaultPort 8443
   }
