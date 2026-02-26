@@ -1,0 +1,692 @@
+﻿# setup-storage.ps1 (Windows)
+# Robust installer for MinIO + Nginx via Docker Compose.
+# - Detects missing prerequisites
+# - Starts Docker Desktop
+# - Waits until Docker Engine is actually ready
+# - Avoids port conflicts
+# - Creates compose project and launches it
+# - NEVER continues if docker engine is not reachable
+
+$ErrorActionPreference = "Stop"
+$Script:LocalS3Label = "com.locals3.installer=true"
+
+function Info($m){ Write-Host "[INFO] $m" }
+function Warn($m){ Write-Host "[WARN] $m" -ForegroundColor Yellow }
+function Err ($m){ Write-Host "[ERROR] $m" -ForegroundColor Red }
+
+function Is-Admin {
+  $p = New-Object Security.Principal.WindowsPrincipal([Security.Principal.WindowsIdentity]::GetCurrent())
+  return $p.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
+}
+
+function Relaunch-Elevated {
+  if (Is-Admin) { return }
+  Warn "Not running as Administrator. Relaunching elevated..."
+  $ps = (Get-Process -Id $PID).Path
+  Start-Process -FilePath $ps -Verb RunAs -ArgumentList @(
+    "-NoProfile","-ExecutionPolicy","Bypass","-File","`"$PSCommandPath`""
+  ) | Out-Null
+  exit 0
+}
+
+function Has-Cmd($name){
+  return [bool](Get-Command $name -ErrorAction SilentlyContinue)
+}
+
+function Normalize-HostInput([string]$raw) {
+  if ([string]::IsNullOrWhiteSpace($raw)) { return "localhost" }
+  $value = $raw.Trim()
+
+  if ($value -match '^[a-zA-Z][a-zA-Z0-9+\-.]*://') {
+    try { $value = ([Uri]$value).Host } catch {}
+  }
+
+  if ($value -match "/") { $value = $value.Split("/")[0] }
+  if ($value -match ":") { $value = $value.Split(":")[0] }
+  $value = $value.Trim().ToLowerInvariant()
+
+  if ($value -notmatch '^[a-z0-9]([a-z0-9\.-]*[a-z0-9])?$') {
+    Err "Invalid domain/host input: '$raw'"
+    Err "Use values like: localhost, mystorage.local, mystorage.com, or https://mystorage.com"
+    exit 1
+  }
+
+  return $value
+}
+
+function Enable-WSLFeatures {
+  Info "Checking Windows features required for WSL2..."
+  $needRestart = $false
+
+  $wsl = (Get-WindowsOptionalFeature -Online -FeatureName Microsoft-Windows-Subsystem-Linux).State
+  if ($wsl -ne "Enabled") {
+    Info "Enabling Microsoft-Windows-Subsystem-Linux..."
+    dism /online /enable-feature /featurename:Microsoft-Windows-Subsystem-Linux /all /norestart | Out-Null
+    $needRestart = $true
+  }
+
+  $vmp = (Get-WindowsOptionalFeature -Online -FeatureName VirtualMachinePlatform).State
+  if ($vmp -ne "Enabled") {
+    Info "Enabling VirtualMachinePlatform..."
+    dism /online /enable-feature /featurename:VirtualMachinePlatform /all /norestart | Out-Null
+    $needRestart = $true
+  }
+
+  if (-not (Has-Cmd "wsl")) {
+    Warn "wsl.exe not found yet. Windows restart is required after enabling features."
+    $needRestart = $true
+  }
+
+  if ($needRestart) {
+    Warn "WSL2 features were enabled/updated. Please RESTART Windows, then run this script again."
+    exit 0
+  }
+
+  # Best-effort sanity
+  try {
+    $status = wsl --status 2>$null
+    if ($status -notmatch "Default Version:\s*2") {
+      Warn "WSL default version is not 2. Setting it to 2..."
+      wsl --set-default-version 2 | Out-Null
+    }
+  } catch {
+    Warn "WSL status not available yet. If Docker fails, run: wsl --install and reboot."
+  }
+
+  Info "WSL2 feature check passed (or already enabled)."
+}
+
+function Ensure-DockerInstalled {
+  Info "Checking Docker installation..."
+  if (Has-Cmd "docker") {
+    Info "Docker CLI found."
+    return
+  }
+
+  Warn "Docker CLI not found."
+  if (-not (Has-Cmd "winget")) {
+    Err "winget is not available. Install Docker Desktop manually, then rerun."
+    exit 1
+  }
+
+  Info "Installing Docker Desktop with winget..."
+  try {
+    winget install -e --id Docker.DockerDesktop --accept-source-agreements --accept-package-agreements | Out-Null
+  } catch {
+    Err "Docker Desktop install failed. Install Docker Desktop manually, then rerun."
+    exit 1
+  }
+
+  Warn "Docker Desktop installed. Please RESTART Windows, start Docker Desktop once, then rerun this script."
+  exit 0
+}
+
+function Start-DockerDesktop {
+  # Start Docker Desktop if possible
+  $exe = "C:\Program Files\Docker\Docker\Docker Desktop.exe"
+  if (Test-Path $exe) {
+    Info "Starting Docker Desktop..."
+    Start-Process $exe | Out-Null
+    return
+  }
+  Warn "Docker Desktop exe not found at default path. Start Docker Desktop manually."
+}
+
+function Test-DockerEngine {
+  $prev = $ErrorActionPreference
+  $ErrorActionPreference = "Continue"
+  docker info 2>&1 | Out-Null
+  $ok = ($LASTEXITCODE -eq 0)
+  $ErrorActionPreference = $prev
+  return $ok
+}
+
+function Wait-DockerEngine {
+  Info "Checking Docker Engine availability..."
+  if (Test-DockerEngine) {
+    Info "Docker Engine is ready."
+    return
+  }
+
+  Warn "Docker Engine not reachable. Attempting to start Docker Desktop..."
+  Start-DockerDesktop
+
+  $maxSeconds = 180
+  $step = 5
+  $elapsed = 0
+
+  while ($elapsed -lt $maxSeconds) {
+    Start-Sleep -Seconds $step
+    $elapsed += $step
+    if (Test-DockerEngine) {
+      Info "Docker Engine is ready."
+      return
+    }
+  }
+
+  Err "Docker Engine is still NOT reachable after waiting."
+  Warn "Run these checks (in Admin PowerShell):"
+  Write-Host "  wsl --status"
+  Write-Host "  wsl --install"
+  Write-Host "  wsl --shutdown"
+  Warn "Then open Docker Desktop and wait until it says 'Engine running'."
+  Warn "If virtualization is disabled, enable it in BIOS (Intel VT-x / AMD SVM)."
+  exit 1
+}
+
+function Ensure-DockerCompose {
+  if (-not (Has-Cmd "docker")) { Err "docker not found unexpectedly."; exit 1 }
+  Sanitize-DockerEnv
+  $prev = $ErrorActionPreference
+  $ErrorActionPreference = "Continue"
+  docker compose version 2>&1 | Out-Null
+  $ok = ($LASTEXITCODE -eq 0)
+  $ErrorActionPreference = $prev
+  if (-not $ok) {
+    Err "docker compose plugin not available. Update Docker Desktop and rerun."
+    exit 1
+  }
+}
+
+function Sanitize-DockerEnv {
+  foreach ($name in @("DOCKER_HOST","DOCKER_CONTEXT","DOCKER_TLS_VERIFY","DOCKER_CERT_PATH","DOCKER_API_VERSION")) {
+    $value = (Get-Item -Path ("Env:" + $name) -ErrorAction SilentlyContinue).Value
+    if ($null -eq $value) { continue }
+    $trim = $value.Trim()
+    $quotedEmpty = ($trim -eq '""' -or $trim -eq "''")
+    $bad = ([string]::IsNullOrWhiteSpace($trim) -or $quotedEmpty)
+
+    # We run compose with explicit --context, so these env vars only create ambiguity.
+    # Clear them unconditionally; report when they look malformed.
+    if ($bad) {
+      Warn "$name is malformed ('$value'); clearing it."
+    } else {
+      Warn "$name is set ('$value'); clearing it so docker --context is authoritative."
+    }
+    Remove-Item -Path ("Env:" + $name) -ErrorAction SilentlyContinue
+  }
+}
+
+function Get-ActiveDockerContext {
+  $prev = $ErrorActionPreference
+  $ErrorActionPreference = "Continue"
+  $ctx = (docker context show 2>$null | Select-Object -First 1)
+  $ErrorActionPreference = $prev
+  if ($ctx) { $ctx = $ctx.Trim() }
+  if (-not $ctx) { $ctx = "default" }
+  return $ctx
+}
+
+function Port-Free([int]$p) {
+  try {
+    $c = Get-NetTCPConnection -LocalPort $p -ErrorAction SilentlyContinue
+    return ($null -eq $c -or $c.Count -eq 0)
+  } catch {
+    $out = netstat -ano | Select-String -Pattern "LISTENING" | Select-String -Pattern (":$p\s")
+    return ($null -eq $out -or $out.Count -eq 0)
+  }
+}
+
+function Get-PortListeners([int]$p) {
+  $items = @()
+  try {
+    $conns = Get-NetTCPConnection -State Listen -LocalPort $p -ErrorAction SilentlyContinue
+    foreach ($c in $conns) {
+      $procName = ""
+      try { $procName = (Get-Process -Id $c.OwningProcess -ErrorAction SilentlyContinue).ProcessName } catch {}
+      $items += [PSCustomObject]@{ Port = $p; PID = $c.OwningProcess; Process = $procName }
+    }
+  } catch {}
+  return $items
+}
+
+function Get-ScriptCreatedContainers([string]$dockerCtx) {
+  $result = @{}
+
+  $prev = $ErrorActionPreference
+  $ErrorActionPreference = "Continue"
+
+  # Reliable path for newer runs (label-based)
+  $rows = @(docker --context $dockerCtx ps -a --filter "label=$($Script:LocalS3Label)" --format "{{.Names}}`t{{.Image}}`t{{.Status}}`t{{.Ports}}" 2>$null)
+  foreach ($r in $rows) {
+    if ([string]::IsNullOrWhiteSpace($r)) { continue }
+    $parts = $r -split "`t", 4
+    if ($parts.Count -lt 4) { continue }
+    $name = $parts[0].Trim()
+    if (-not $name) { continue }
+    $result[$name] = [PSCustomObject]@{
+      Name = $name; Image = $parts[1].Trim(); Status = $parts[2].Trim(); Ports = $parts[3].Trim()
+    }
+  }
+
+  # Legacy path for older runs (best effort)
+  foreach ($legacyName in @("minio","nginx")) {
+    $legacyRows = @(docker --context $dockerCtx ps -a --filter "name=^${legacyName}$" --format "{{.Names}}`t{{.Image}}`t{{.Status}}`t{{.Ports}}" 2>$null)
+    foreach ($r in $legacyRows) {
+      if ([string]::IsNullOrWhiteSpace($r)) { continue }
+      $parts = $r -split "`t", 4
+      if ($parts.Count -lt 4) { continue }
+      $name = $parts[0].Trim()
+      if (-not $name) { continue }
+      if (-not $result.ContainsKey($name)) {
+        $result[$name] = [PSCustomObject]@{
+          Name = $name; Image = $parts[1].Trim(); Status = $parts[2].Trim(); Ports = $parts[3].Trim()
+        }
+      }
+    }
+  }
+
+  $ErrorActionPreference = $prev
+  return @($result.Values)
+}
+
+function Prompt-CleanupPreviousServers([string]$dockerCtx) {
+  $existing = @(Get-ScriptCreatedContainers -dockerCtx $dockerCtx)
+  if ($existing.Count -eq 0) { return }
+
+  Warn "Found existing S3 containers from previous runs:"
+  $existing | Sort-Object Name | Format-Table -AutoSize | Out-String | Write-Host
+
+  $ans = (Read-Host "Delete these previous containers before creating a new server? (Y/n)").Trim().ToLowerInvariant()
+  if ($ans -eq "" -or $ans -eq "y" -or $ans -eq "yes") {
+    $prev = $ErrorActionPreference
+    $ErrorActionPreference = "Continue"
+    foreach ($c in $existing) {
+      docker --context $dockerCtx rm -f $c.Name 2>$null | Out-Null
+    }
+    docker --context $dockerCtx network rm storage-net 2>$null | Out-Null
+    $ErrorActionPreference = $prev
+    Info "Previous containers were removed."
+  } else {
+    Warn "Keeping previous containers. This may cause port conflicts."
+  }
+}
+
+function Pick-Port([int[]]$candidates) {
+  foreach ($p in $candidates) { if (Port-Free $p) { return $p } }
+  return $null
+}
+
+function Get-LanIPv4 {
+  try {
+    $ip = Get-NetIPAddress -AddressFamily IPv4 -PrefixOrigin Dhcp -ErrorAction SilentlyContinue |
+      Where-Object { $_.IPAddress -notlike "169.254.*" -and $_.IPAddress -ne "127.0.0.1" } |
+      Select-Object -First 1 -ExpandProperty IPAddress
+    if ($ip) { return $ip }
+  } catch {}
+
+  try {
+    $ip = (Get-NetIPAddress -AddressFamily IPv4 -ErrorAction SilentlyContinue |
+      Where-Object {
+        $_.IPAddress -notlike "169.254.*" -and
+        $_.IPAddress -ne "127.0.0.1" -and
+        $_.InterfaceAlias -notmatch "vEthernet|Hyper-V|WSL|Loopback"
+      } |
+      Select-Object -First 1 -ExpandProperty IPAddress)
+    return $ip
+  } catch {
+    return $null
+  }
+}
+
+function Ensure-FirewallPort443 {
+  $ruleName = "Local S3 HTTPS 443"
+  $rule = Get-NetFirewallRule -DisplayName $ruleName -ErrorAction SilentlyContinue
+  if ($rule) {
+    Info "Firewall rule already exists: $ruleName"
+    return
+  }
+
+  Info "Opening Windows Firewall inbound TCP 443..."
+  New-NetFirewallRule -DisplayName $ruleName -Direction Inbound -Action Allow -Protocol TCP -LocalPort 443 | Out-Null
+}
+
+function Ensure-HostsEntry([string]$domain) {
+  if ($domain -eq "localhost") { return }
+  $hostsPath = Join-Path $env:SystemRoot "System32\drivers\etc\hosts"
+  $escaped = [regex]::Escape($domain)
+  $existing = Get-Content -Path $hostsPath -ErrorAction SilentlyContinue
+  if ($existing -match "(?im)^\s*(127\.0\.0\.1|::1)\s+.*\b$escaped\b") {
+    Info "Hosts entry already exists for $domain"
+    return
+  }
+
+  Warn "Adding local hosts mapping: 127.0.0.1 $domain"
+  Add-Content -Path $hostsPath -Value "`r`n127.0.0.1`t$domain"
+}
+
+function Ensure-LocalTlsCert([string]$dockerCtx, [string]$certDir, [string]$domain, [string]$lanIp) {
+  $crt = Join-Path $certDir "localhost.crt"
+  $key = Join-Path $certDir "localhost.key"
+  $san = "DNS:localhost,IP:127.0.0.1"
+  if ($domain -ne "localhost") { $san += ",DNS:$domain" }
+  if ($lanIp) { $san += ",IP:$lanIp" }
+
+  Info "Generating self-signed TLS certificate for localhost/$domain..."
+  New-Item -ItemType Directory -Force -Path $certDir | Out-Null
+  Remove-Item -Path $crt,$key -Force -ErrorAction SilentlyContinue
+
+  $prev = $ErrorActionPreference
+  $ErrorActionPreference = "Continue"
+  docker --context $dockerCtx run --rm -v "${certDir}:/out" alpine:3.20 sh -lc "apk add --no-cache openssl >/dev/null && openssl req -x509 -nodes -newkey rsa:2048 -days 825 -keyout /out/localhost.key -out /out/localhost.crt -subj '/CN=$domain' -addext 'subjectAltName=$san'" 2>&1 | Out-Null
+  $exit = $LASTEXITCODE
+  $ErrorActionPreference = $prev
+
+  if ($exit -ne 0 -or -not (Test-Path $crt) -or -not (Test-Path $key)) {
+    Err "Failed to generate TLS certificate/key for Nginx."
+    exit 1
+  }
+}
+
+function Trust-LocalTlsCert([string]$certPath) {
+  try {
+    $cert = New-Object System.Security.Cryptography.X509Certificates.X509Certificate2($certPath)
+    $store = New-Object System.Security.Cryptography.X509Certificates.X509Store("Root","LocalMachine")
+    $store.Open([System.Security.Cryptography.X509Certificates.OpenFlags]::ReadWrite)
+    $exists = $store.Certificates | Where-Object { $_.Thumbprint -eq $cert.Thumbprint }
+    if ($exists.Count -eq 0) {
+      $store.Add($cert)
+      Info "Trusted TLS certificate in LocalMachine\\Root."
+    } else {
+      Info "TLS certificate is already trusted."
+    }
+    $store.Close()
+  } catch {
+    Warn "Could not trust the certificate automatically. Run this in Admin PowerShell:"
+    Write-Host "  Import-Certificate -FilePath `"$certPath`" -CertStoreLocation `"Cert:\LocalMachine\Root`""
+  }
+}
+
+function Start-ContainersFallback([string]$dockerCtx, [string]$ngconf, [string]$ngcerts, [string]$data, [int]$nginxHttpsPort, [int]$minioApi, [int]$minioUI) {
+  Warn "Falling back to direct 'docker run' startup (compose unavailable in this environment)."
+  $network = "storage-net"
+
+  $prev = $ErrorActionPreference
+  $ErrorActionPreference = "Continue"
+  docker --context $dockerCtx network create $network 2>$null | Out-Null
+  docker --context $dockerCtx rm -f minio nginx 2>$null | Out-Null
+
+  docker --context $dockerCtx run -d `
+    --name minio `
+    --label $Script:LocalS3Label `
+    --label "com.locals3.role=minio" `
+    --network $network `
+    -e MINIO_ROOT_USER=admin `
+    -e MINIO_ROOT_PASSWORD=StrongPassword123 `
+    -p "${minioApi}:9000" `
+    -p "${minioUI}:9001" `
+    -v "${data}:/data" `
+    minio/minio server /data --console-address ":9001" | Out-Null
+  $minioExit = $LASTEXITCODE
+  if ($minioExit -ne 0) {
+    $ErrorActionPreference = $prev
+    Err "Failed to start MinIO container via fallback mode."
+    exit 1
+  }
+
+  docker --context $dockerCtx run -d `
+    --name nginx `
+    --label $Script:LocalS3Label `
+    --label "com.locals3.role=nginx" `
+    --network $network `
+    -p "${nginxHttpsPort}:443" `
+    -v "${ngconf}:/etc/nginx/conf.d:ro" `
+    -v "${ngcerts}:/etc/nginx/certs:ro" `
+    nginx:latest | Out-Null
+  $nginxExit = $LASTEXITCODE
+  $ErrorActionPreference = $prev
+  if ($nginxExit -ne 0) {
+    Err "Failed to start Nginx container via fallback mode."
+    exit 1
+  }
+}
+
+function Write-FilesAndUp {
+  $root = Split-Path -Parent $PSCommandPath
+  $project = Join-Path $root "storage-server"
+  $ngconf = Join-Path $project "nginx\conf"
+  $ngcerts = Join-Path $project "nginx\certs"
+  $data   = Join-Path $project "data"
+
+  $domainInput = Read-Host "Enter local domain/URL for HTTPS (default: localhost)"
+  $domain = Normalize-HostInput $domainInput
+  Info "Using local domain: $domain"
+  $lanAnswer = (Read-Host "Allow other computers on your network to access this server? (y/N)").Trim().ToLowerInvariant()
+  $enableLan = ($lanAnswer -eq "y" -or $lanAnswer -eq "yes")
+  $lanIp = $null
+  if ($enableLan) {
+    $lanIp = Get-LanIPv4
+    if (-not $lanIp) {
+      Warn "Could not detect LAN IPv4 automatically. LAN URL will not be shown."
+    } else {
+      Info "Detected LAN IP: $lanIp"
+    }
+    Ensure-FirewallPort443
+  }
+
+  # Resolve Docker context early so we can clean up previous installer containers if needed.
+  $prev = $ErrorActionPreference
+  $ErrorActionPreference = "Continue"
+  Sanitize-DockerEnv
+  $dockerCtx = Get-ActiveDockerContext
+  $ErrorActionPreference = $prev
+  Info "Using Docker context: $dockerCtx"
+  Prompt-CleanupPreviousServers -dockerCtx $dockerCtx
+
+  $nginxHttps  = 443
+  $minioApi    = Pick-Port @(9000,19000,29000)
+  $minioUI     = Pick-Port @(9001,19001,29001)
+
+  if (-not (Port-Free $nginxHttps)) {
+    Warn "Port 443 is already in use."
+    $listeners = Get-PortListeners 443
+    if ($listeners.Count -gt 0) {
+      Write-Host "Port 443 listeners:"
+      $listeners | Format-Table -AutoSize | Out-String | Write-Host
+    }
+    $ans = (Read-Host "Use alternate HTTPS port (8443/9443/10443)? (y/N)").Trim().ToLowerInvariant()
+    if ($ans -eq "y" -or $ans -eq "yes") {
+      $nginxHttps = Pick-Port @(8443,9443,10443)
+      if (-not $nginxHttps) {
+        Err "No free alternate HTTPS port (8443/9443/10443)."
+        exit 1
+      }
+      Warn "Using alternate HTTPS port: $nginxHttps"
+    } else {
+      Err "Port 443 is required but currently in use. Free it and rerun."
+      exit 1
+    }
+  }
+  if (-not $minioApi)  { Err "No free port for MinIO API (9000/19000/29000)."; exit 1 }
+  if (-not $minioUI)   { Err "No free port for MinIO UI (9001/19001/29001)."; exit 1 }
+
+  Info "Using ports:"
+  Info " - Nginx HTTPS: $nginxHttps"
+  Info " - MinIO API:  $minioApi"
+  Info " - MinIO UI:   $minioUI"
+
+  New-Item -ItemType Directory -Force -Path $ngconf | Out-Null
+  New-Item -ItemType Directory -Force -Path $ngcerts | Out-Null
+  New-Item -ItemType Directory -Force -Path $data | Out-Null
+
+  Info "Project folder: $project"
+
+  $compose = @"
+services:
+  minio:
+    image: minio/minio
+    container_name: minio
+    labels:
+      - "com.locals3.installer=true"
+      - "com.locals3.role=minio"
+    command: server /data --console-address ":9001"
+    environment:
+      MINIO_ROOT_USER: admin
+      MINIO_ROOT_PASSWORD: StrongPassword123
+    volumes:
+      - ./data:/data
+    ports:
+      - "$minioApi:9000"
+      - "$minioUI:9001"
+    restart: unless-stopped
+
+  nginx:
+    image: nginx:latest
+    container_name: nginx
+    labels:
+      - "com.locals3.installer=true"
+      - "com.locals3.role=nginx"
+    ports:
+      - "$nginxHttps:443"
+    volumes:
+      - ./nginx/conf:/etc/nginx/conf.d:ro
+      - ./nginx/certs:/etc/nginx/certs:ro
+    depends_on:
+      - minio
+    restart: unless-stopped
+"@
+
+  $serverNames = if ($domain -eq "localhost") { "localhost" } else { "$domain localhost" }
+  $nginx = @"
+server {
+    listen 443 ssl;
+    server_name $serverNames;
+    ssl_certificate /etc/nginx/certs/localhost.crt;
+    ssl_certificate_key /etc/nginx/certs/localhost.key;
+
+    location / {
+        proxy_pass http://minio:9001;
+        proxy_http_version 1.1;
+        proxy_set_header Host `$http_host;
+        proxy_set_header X-Real-IP `$remote_addr;
+        proxy_set_header X-Forwarded-For `$proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto https;
+        proxy_set_header Upgrade `$http_upgrade;
+        proxy_set_header Connection "upgrade";
+        proxy_read_timeout 3600;
+    }
+}
+"@
+
+  $utf8NoBom = New-Object System.Text.UTF8Encoding($false)
+  [System.IO.File]::WriteAllText((Join-Path $project "docker-compose.yml"), $compose, $utf8NoBom)
+  [System.IO.File]::WriteAllText((Join-Path $ngconf  "default.conf"),       $nginx,   $utf8NoBom)
+  Ensure-HostsEntry -domain $domain
+  Ensure-LocalTlsCert -dockerCtx $dockerCtx -certDir $ngcerts -domain $domain -lanIp $lanIp
+  Trust-LocalTlsCert -certPath (Join-Path $ngcerts "localhost.crt")
+
+  Info "Starting containers..."
+  Push-Location $project
+  $usedFallback = $false
+
+  # Remove existing containers if present (don't error if they don't exist)
+  $ErrorActionPreference = "Continue"
+  docker --context $dockerCtx rm -f minio nginx 2>$null | Out-Null
+  $ErrorActionPreference = $prev
+
+  # Ensure engine still ok right before up
+  if (-not (Test-DockerEngine)) {
+    Pop-Location
+    Err "Docker Engine became unavailable right before startup."
+    exit 1
+  }
+
+  $ErrorActionPreference = "Continue"
+  $composeOut = docker --context $dockerCtx compose up -d 2>&1
+  $upExit = $LASTEXITCODE
+  $ErrorActionPreference = $prev
+  if ($upExit -ne 0) {
+    $composeText = ($composeOut | Out-String)
+    Warn "docker compose up failed."
+    if ($composeText -match "invalid proto:") {
+      Warn "Detected compose transport error ('invalid proto:')."
+      Pop-Location
+      Start-ContainersFallback -dockerCtx $dockerCtx -ngconf $ngconf -ngcerts $ngcerts -data $data -nginxHttpsPort $nginxHttps -minioApi $minioApi -minioUI $minioUI
+      $usedFallback = $true
+    } else {
+      Warn "Showing compose logs..."
+      $ErrorActionPreference = "Continue"
+      docker --context $dockerCtx compose logs --no-color --tail 200 2>&1
+      $ErrorActionPreference = $prev
+      Pop-Location
+      exit 1
+    }
+  }
+
+  Start-Sleep -Seconds 3
+
+  $names = @(docker --context $dockerCtx ps --format "{{.Names}}")
+  if ($names -notcontains "minio" -or $names -notcontains "nginx") {
+    Warn "Containers not running as expected. Logs:"
+    $ErrorActionPreference = "Continue"
+    if ($usedFallback) {
+      docker --context $dockerCtx ps -a --filter "name=minio" --filter "name=nginx" --format "table {{.Names}}\t{{.Status}}\t{{.Ports}}" 2>&1
+      Write-Host ""
+      Write-Host "--- minio logs ---"
+      docker --context $dockerCtx logs --tail 200 minio 2>&1
+      Write-Host ""
+      Write-Host "--- nginx logs ---"
+      docker --context $dockerCtx logs --tail 200 nginx 2>&1
+    } else {
+      docker --context $dockerCtx compose logs --no-color --tail 200 2>&1
+    }
+    $ErrorActionPreference = $prev
+    Pop-Location
+    exit 1
+  }
+
+  Pop-Location
+
+  Write-Host ""
+  Write-Host "===== INSTALLATION COMPLETE ====="
+  Write-Host "MinIO Console: http://localhost:$minioUI"
+  Write-Host "MinIO API:     http://localhost:$minioApi"
+  $proxyUrl = if ($nginxHttps -eq 443) { "https://$domain" } else { "https://${domain}:$nginxHttps" }
+  Write-Host "Proxy URL:     $proxyUrl"
+  if ($enableLan -and $lanIp) {
+    $lanUrl = if ($nginxHttps -eq 443) { "https://$lanIp" } else { "https://${lanIp}:$nginxHttps" }
+    Write-Host "LAN URL:       $lanUrl"
+  }
+  Write-Host ""
+  Write-Host "TLS note:"
+  Write-Host "  Self-signed cert has been trusted in LocalMachine\\Root."
+  Write-Host ""
+  Write-Host "Login:"
+  Write-Host "  Username: admin"
+  Write-Host "  Password: StrongPassword123"
+  Write-Host ""
+  Write-Host "Next: open MinIO Console, create bucket: images"
+  if ($enableLan -and $lanIp) {
+    Write-Host ""
+    Write-Host "For other computers:"
+    if ($domain -ne "localhost") {
+      Write-Host "  Add hosts entry: $lanIp $domain"
+      if ($nginxHttps -eq 443) {
+        Write-Host "  Then open: https://$domain"
+      } else {
+        Write-Host "  Then open: https://${domain}:$nginxHttps"
+      }
+    } else {
+      if ($nginxHttps -eq 443) {
+        Write-Host "  Open: https://$lanIp"
+      } else {
+        Write-Host "  Open: https://${lanIp}:$nginxHttps"
+      }
+    }
+    Write-Host "  Trust cert file on client (optional, avoids warning):"
+    Write-Host "  $($ngcerts)\localhost.crt"
+  }
+}
+
+# ---------------------------
+# Main
+# ---------------------------
+Relaunch-Elevated
+Info "===== Local S3 Storage Installer (Windows) ====="
+Enable-WSLFeatures
+Ensure-DockerInstalled
+Sanitize-DockerEnv
+Wait-DockerEngine
+Ensure-DockerCompose
+Write-FilesAndUp
+
