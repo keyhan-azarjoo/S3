@@ -2,12 +2,16 @@
 
 Automated local S3-compatible storage setup using:
 - MinIO (object storage)
-- Nginx (HTTPS reverse proxy)
-- Docker / Docker Compose (with fallback to `docker run` when Compose transport is broken)
+- HTTPS reverse proxy
+- Windows mode selection:
+  - IIS mode (native MinIO + IIS reverse proxy)
+  - Docker mode (MinIO + Nginx containers)
+- Linux/macOS: native install (no Docker)
 
 This project includes:
-- `setup-storage.ps1` for Windows
-- `setup-storage.sh` for Linux/macOS
+- `windows/setup-storage.ps1` for Windows (IIS or Docker)
+- `windows/installers/install-iis-prereqs.ps1` for IIS prerequisites
+- `linux-macos/setup-storage.sh` for Linux/macOS (native only)
 
 ## Features
 
@@ -19,6 +23,12 @@ This project includes:
 - Self-signed certificate generation and local trust attempt
 
 ## Windows Usage
+
+Installer asks:
+- `1) IIS`
+- `2) Docker`
+
+If you select Docker mode, Docker Desktop must already be installed.
 
 Docker Desktop is a required prerequisite.  
 Install it manually first (do not install from terminal commands):
@@ -37,31 +47,26 @@ Set-ExecutionPolicy Bypass -Scope Process -Force
 Then run the installer from this repo:
 
 ```powershell
-.\setup-storage.ps1
+.\windows\setup-storage.ps1
 ```
 
 Script reference:
 
-`https://github.com/keyhan-azarjoo/S3/blob/main/setup-storage.ps1`
+`https://github.com/keyhan-azarjoo/S3/blob/main/windows/setup-storage.ps1`
 
 One-line run from GitHub (PowerShell):
 
 ```powershell
-powershell -NoProfile -ExecutionPolicy Bypass -Command "Invoke-WebRequest -Uri 'https://raw.githubusercontent.com/keyhan-azarjoo/S3/main/setup-storage.ps1' -OutFile 'setup-storage.ps1'; .\setup-storage.ps1"
+powershell -NoProfile -ExecutionPolicy Bypass -Command "Invoke-WebRequest -Uri 'https://raw.githubusercontent.com/keyhan-azarjoo/S3/main/windows/setup-storage.ps1' -OutFile 'setup-storage.ps1'; .\setup-storage.ps1"
 ```
 
 ## Linux/macOS Usage
 
 ```bash
-chmod +x setup-storage.sh
-./setup-storage.sh
+chmod +x linux-macos/setup-storage.sh
+sudo ./linux-macos/setup-storage.sh
 ```
-
-One-line run from GitHub (curl-style):
-
-```bash
-curl -fsSL https://raw.githubusercontent.com/keyhan-azarjoo/S3/main/setup-storage.sh -o setup-storage.sh && chmod +x setup-storage.sh && sudo ./setup-storage.sh
-```
+Linux/macOS installer is native (no Docker required).
 
 ## Access URLs
 

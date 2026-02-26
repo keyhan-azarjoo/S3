@@ -192,6 +192,155 @@ function Normalize-HostInput([string]$raw) {
   return $value
 }
 
+function Ask-InstallMode {
+  Write-Host ""
+  Write-Host "Choose installation mode:"
+  Write-Host "  1) IIS (native MinIO + IIS reverse proxy)"
+  Write-Host "  2) Docker (MinIO + Nginx containers)"
+  $choice = (Read-Host "Select 1 or 2 (default: 1)").Trim()
+  if ($choice -eq "2") { return "docker" }
+  return "iis"
+}
+
+function Ensure-IISInstalled {
+  $root = Split-Path -Parent $PSCommandPath
+  $installer = Join-Path $root "installers\install-iis-prereqs.ps1"
+  if (-not (Test-Path $installer)) {
+    Err "IIS installer script not found: $installer"
+    exit 1
+  }
+  Info "Running IIS prerequisites installer..."
+  & powershell -NoProfile -ExecutionPolicy Bypass -File $installer
+  if ($LASTEXITCODE -ne 0) {
+    Err "IIS prerequisites installation failed."
+    exit 1
+  }
+}
+
+function Ensure-MinIONative([string]$root,[int]$apiPort,[int]$uiPort) {
+  $binDir = Join-Path $root "minio"
+  $dataDir = Join-Path $root "data"
+  $exe = Join-Path $binDir "minio.exe"
+  New-Item -ItemType Directory -Force -Path $binDir,$dataDir | Out-Null
+  if (-not (Test-Path $exe)) {
+    Info "Downloading MinIO server binary..."
+    Invoke-WebRequest -Uri "https://dl.min.io/server/minio/release/windows-amd64/minio.exe" -OutFile $exe
+  }
+
+  [Environment]::SetEnvironmentVariable("MINIO_ROOT_USER","admin","Machine")
+  [Environment]::SetEnvironmentVariable("MINIO_ROOT_PASSWORD","StrongPassword123","Machine")
+
+  $taskName = "LocalS3-MinIO"
+  $cmd = "`"$exe`" server `"$dataDir`" --address `":$apiPort`" --console-address `":$uiPort`""
+  schtasks /Delete /TN $taskName /F 2>$null | Out-Null
+  schtasks /Create /TN $taskName /SC ONSTART /RU SYSTEM /TR $cmd /F | Out-Null
+  schtasks /Run /TN $taskName | Out-Null
+}
+
+function Ensure-IISProxyMode([string]$domain,[string]$siteRoot,[string]$certPath,[string]$keyPath,[int]$httpsPort,[int]$targetPort,[string]$lanIp) {
+  Import-Module WebAdministration
+  New-Item -ItemType Directory -Force -Path $siteRoot | Out-Null
+  $webConfig = @"
+<?xml version="1.0" encoding="utf-8"?>
+<configuration>
+  <system.webServer>
+    <rewrite>
+      <rules>
+        <rule name="ReverseProxyInboundRule1" stopProcessing="true">
+          <match url="(.*)" />
+          <action type="Rewrite" url="http://127.0.0.1:$targetPort/{R:1}" />
+        </rule>
+      </rules>
+    </rewrite>
+  </system.webServer>
+</configuration>
+"@
+  [System.IO.File]::WriteAllText((Join-Path $siteRoot "web.config"), $webConfig, (New-Object System.Text.UTF8Encoding($false)))
+
+  try {
+    Set-WebConfigurationProperty -PSPath 'MACHINE/WEBROOT/APPHOST' -Filter "system.webServer/proxy" -Name "enabled" -Value "True" -ErrorAction Stop | Out-Null
+  } catch {
+    Err "IIS reverse proxy is not available (ARR/URL Rewrite missing)."
+    Warn "Install these IIS extensions, then rerun in IIS mode:"
+    Write-Host "  - URL Rewrite"
+    Write-Host "  - Application Request Routing (ARR)"
+    exit 1
+  }
+
+  $certDns = @("localhost",$domain) | Select-Object -Unique
+  $cert = New-SelfSignedCertificate -DnsName $certDns -CertStoreLocation "Cert:\LocalMachine\My" -NotAfter (Get-Date).AddYears(2)
+  $thumb = $cert.Thumbprint
+  Import-Certificate -FilePath (Export-Certificate -Cert "Cert:\LocalMachine\My\$thumb" -FilePath $certPath -Force).FullName -CertStoreLocation "Cert:\LocalMachine\Root" | Out-Null
+
+  if (Test-Path "IIS:\Sites\LocalS3-IIS") {
+    Remove-Website -Name "LocalS3-IIS"
+  }
+  New-Website -Name "LocalS3-IIS" -PhysicalPath $siteRoot -Port 80 -IPAddress "*" -HostHeader $domain | Out-Null
+  New-WebBinding -Name "LocalS3-IIS" -Protocol "https" -Port $httpsPort -IPAddress "*" -HostHeader $domain -SslFlags 1 | Out-Null
+  (Get-WebBinding -Name "LocalS3-IIS" -Protocol https -Port $httpsPort -HostHeader $domain).AddSslCertificate($thumb,"My")
+
+  if ($domain -ne "localhost") { Ensure-HostsEntry -domain $domain }
+  if ($lanIp) { Ensure-FirewallPort443 }
+}
+
+function Install-IISMode {
+  $root = Join-Path (Split-Path -Parent $PSCommandPath) "storage-server"
+  $certDir = Join-Path $root "nginx\certs"
+  $siteRoot = Join-Path $root "iis-site"
+  New-Item -ItemType Directory -Force -Path $certDir,$siteRoot | Out-Null
+
+  $domainInput = Read-Host "Enter local domain/URL for HTTPS (default: localhost)"
+  $domain = Normalize-HostInput $domainInput
+  Info "Using local domain: $domain"
+  $lanAnswer = (Read-Host "Allow other computers on your network to access this server? (y/N)").Trim().ToLowerInvariant()
+  $enableLan = ($lanAnswer -eq "y" -or $lanAnswer -eq "yes")
+  $lanIp = $null
+  if ($enableLan) {
+    $lanIp = Get-LanIPv4
+    if ($lanIp) { Info "Detected LAN IP: $lanIp" } else { Warn "Could not detect LAN IP automatically." }
+  }
+
+  $httpsPort = 443
+  if (-not (Port-Free $httpsPort)) {
+    Warn "Port 443 is already in use."
+    $httpsPort = Pick-Port @(8443,9443,10443)
+    if (-not $httpsPort) { Err "No free HTTPS port available."; exit 1 }
+    Warn "Using alternate HTTPS port: $httpsPort"
+  }
+
+  $apiPort = Pick-Port @(9000,19000,29000)
+  $uiPort = Pick-Port @(9001,19001,29001)
+  if (-not $apiPort -or -not $uiPort) { Err "No free MinIO ports available."; exit 1 }
+
+  Ensure-IISInstalled
+  Ensure-MinIONative -root $root -apiPort $apiPort -uiPort $uiPort
+  $crt = Join-Path $certDir "localhost.crt"
+  $key = Join-Path $certDir "localhost.key"
+  Ensure-IISProxyMode -domain $domain -siteRoot $siteRoot -certPath $crt -keyPath $key -httpsPort $httpsPort -targetPort $uiPort -lanIp $lanIp
+
+  Write-Host ""
+  Write-Host "===== INSTALLATION COMPLETE (IIS MODE) ====="
+  Write-Host "MinIO Console (direct): http://localhost:$uiPort"
+  Write-Host "MinIO API (direct):     http://localhost:$apiPort"
+  if ($httpsPort -eq 443) {
+    Write-Host "IIS Proxy URL:          https://$domain"
+  } else {
+    Write-Host "IIS Proxy URL:          https://${domain}:$httpsPort"
+  }
+  if ($enableLan -and $lanIp) {
+    if ($httpsPort -eq 443) {
+      Write-Host "LAN URL:                https://$lanIp"
+    } else {
+      Write-Host "LAN URL:                https://${lanIp}:$httpsPort"
+    }
+    Write-Host "For DNS: map $domain -> $lanIp"
+  }
+  Write-Host ""
+  Write-Host "Login:"
+  Write-Host "  Username: admin"
+  Write-Host "  Password: StrongPassword123"
+}
+
 function Enable-WSLFeatures {
   Info "Checking Windows features required for WSL2..."
   $needRestart = $false
@@ -814,6 +963,12 @@ server {
 # ---------------------------
 Relaunch-Elevated
 Info "===== Local S3 Storage Installer (Windows) ====="
+$mode = Ask-InstallMode
+if ($mode -eq "iis") {
+  Install-IISMode
+  exit 0
+}
+
 Enable-WSLFeatures
 Ensure-DockerInstalled
 if (Finish-Or-Restart) { exit 0 }
