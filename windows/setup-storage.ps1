@@ -257,7 +257,7 @@ function Ensure-IISInstalled {
     Info "IIS URL Rewrite not found. Installing..."
     $rewriteUrls = @(
       "https://download.microsoft.com/download/1/2/8/128E2E22-C1B9-44A4-BE2A-5859ED1D4592/rewrite_amd64_en-US.msi",
-      "https://raw.githubusercontent.com/keyhan-azarjoo/S3/main/windows/installers/rewrite_amd64_en-US.msi"
+      "https://www.iis.net/downloads/microsoft/url-rewrite"
     )
     if (-not (Install-MsiFromUrlsLocal -urls $rewriteUrls -outFile $rewriteMsi)) {
       Err "Failed to install IIS URL Rewrite automatically."
@@ -271,7 +271,7 @@ function Ensure-IISInstalled {
     Info "IIS ARR not found. Installing..."
     $arrUrls = @(
       "https://go.microsoft.com/fwlink/?LinkID=615136",
-      "https://raw.githubusercontent.com/keyhan-azarjoo/S3/main/windows/installers/requestRouter_x64.msi"
+      "https://www.iis.net/downloads/microsoft/application-request-routing"
     )
     if (-not (Install-MsiFromUrlsLocal -urls $arrUrls -outFile $arrMsi)) {
       Err "Failed to install IIS ARR automatically."
@@ -280,6 +280,8 @@ function Ensure-IISInstalled {
   } else {
     Info "IIS ARR already installed."
   }
+
+  Info "IIS prerequisites installed successfully."
 }
 
 function Ensure-MinIONative([string]$root,[int]$apiPort,[int]$uiPort) {
