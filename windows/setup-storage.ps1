@@ -209,7 +209,21 @@ function Ensure-IISInstalled {
     $f = Get-WindowsOptionalFeature -Online -FeatureName $name -ErrorAction SilentlyContinue
     if ($f -and $f.State -eq "Enabled") { return }
     Info "Enabling Windows feature: $name"
-    dism /online /enable-feature /featurename:$name /all /norestart | Out-Null
+    $enabled = $false
+    try {
+      Enable-WindowsOptionalFeature -Online -FeatureName $name -All -NoRestart -ErrorAction Stop | Out-Null
+      $enabled = $true
+    } catch {
+      Warn "PowerShell feature enable failed for $name. Trying DISM..."
+    }
+    if (-not $enabled) {
+      dism /online /enable-feature /featurename:$name /all /norestart | Out-Null
+    }
+    $verify = Get-WindowsOptionalFeature -Online -FeatureName $name -ErrorAction SilentlyContinue
+    if (-not $verify -or $verify.State -ne "Enabled") {
+      Err "Failed to enable required Windows feature: $name"
+      exit 1
+    }
   }
 
   function Is-AppInstalledLocal([string]$displayNamePattern) {
@@ -359,8 +373,8 @@ function Install-IISMode {
   $domainInput = Read-Host "Enter local domain/URL for HTTPS (default: localhost)"
   $domain = Normalize-HostInput $domainInput
   Info "Using local domain: $domain"
-  $lanAnswer = (Read-Host "Allow other computers on your network to access this server? (y/N)").Trim().ToLowerInvariant()
-  $enableLan = ($lanAnswer -eq "y" -or $lanAnswer -eq "yes")
+  $enableLan = $true
+  Info "LAN access: enabled"
   $lanIp = $null
   if ($enableLan) {
     $lanIp = Get-LanIPv4
@@ -798,8 +812,8 @@ function Write-FilesAndUp {
   $domainInput = Read-Host "Enter local domain/URL for HTTPS (default: localhost)"
   $domain = Normalize-HostInput $domainInput
   Info "Using local domain: $domain"
-  $lanAnswer = (Read-Host "Allow other computers on your network to access this server? (y/N)").Trim().ToLowerInvariant()
-  $enableLan = ($lanAnswer -eq "y" -or $lanAnswer -eq "yes")
+  $enableLan = $true
+  Info "LAN access: enabled"
   $lanIp = $null
   if ($enableLan) {
     $lanIp = Get-LanIPv4
