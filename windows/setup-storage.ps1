@@ -313,9 +313,24 @@ function Ensure-MinIONative([string]$root,[int]$apiPort,[int]$uiPort) {
 
   $taskName = "LocalS3-MinIO"
   $cmd = "`"$exe`" server `"$dataDir`" --address `":$apiPort`" --console-address `":$uiPort`""
-  schtasks /Delete /TN $taskName /F 2>$null | Out-Null
-  schtasks /Create /TN $taskName /SC ONSTART /RU SYSTEM /TR $cmd /F | Out-Null
-  schtasks /Run /TN $taskName | Out-Null
+  $prev = $ErrorActionPreference
+  $ErrorActionPreference = "Continue"
+  schtasks /Query /TN $taskName 1>$null 2>$null
+  if ($LASTEXITCODE -eq 0) {
+    schtasks /Delete /TN $taskName /F 1>$null 2>$null
+  }
+  schtasks /Create /TN $taskName /SC ONSTART /RU SYSTEM /TR $cmd /F 1>$null 2>$null
+  $createExit = $LASTEXITCODE
+  if ($createExit -ne 0) {
+    $ErrorActionPreference = $prev
+    Err "Failed to create MinIO scheduled task."
+    exit 1
+  }
+  schtasks /Run /TN $taskName 1>$null 2>$null | Out-Null
+  if ($LASTEXITCODE -ne 0) {
+    Warn "MinIO task created but could not be started immediately. It will run at next startup."
+  }
+  $ErrorActionPreference = $prev
 }
 
 function Ensure-IISProxyMode([string]$domain,[string]$siteRoot,[string]$certPath,[string]$keyPath,[int]$httpsPort,[int]$targetPort,[string]$lanIp) {
