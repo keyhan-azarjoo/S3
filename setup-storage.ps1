@@ -243,43 +243,13 @@ function Ensure-DockerInstalled {
     return
   }
 
-  Warn "Docker CLI not found."
-  $installNow = (Read-Host "Docker Desktop is required. Install automatically now? (Y/n)").Trim().ToLowerInvariant()
-  if ($installNow -ne "" -and $installNow -ne "y" -and $installNow -ne "yes") {
-    Err "Docker Desktop is required. Install it and rerun."
-    exit 1
-  }
-
-  if (Has-Cmd "winget") {
-    Info "Installing Docker Desktop with winget..."
-    try {
-      winget install -e --id Docker.DockerDesktop --accept-source-agreements --accept-package-agreements | Out-Null
-    } catch {
-      Warn "winget install failed. Trying direct download installer..."
-      try {
-        if (-not (Install-DockerDesktopDirect)) { throw "download/install failed" }
-      } catch {
-        Err "Docker Desktop install failed. Install manually, then rerun."
-        exit 1
-      }
-    }
-  } else {
-    Info "winget not available. Installing Docker Desktop via direct download..."
-    try {
-      if (-not (Install-DockerDesktopDirect)) { throw "download/install failed" }
-    } catch {
-      Err "Docker Desktop install failed. Install manually, then rerun."
-      exit 1
-    }
-  }
-
-  Try-EnableDockerCliFromDefaultPath
-  if (-not (Has-Cmd "docker")) {
-    Mark-RestartRequired "Docker Desktop installed (CLI not yet available in current session)"
-    Warn "Docker Desktop install completed. Restart queued so setup can continue."
-    return
-  }
-  Warn "Docker Desktop installation finished. Continuing without immediate restart."
+  Err "Docker CLI not found."
+  Warn "Please install Docker Desktop manually, then rerun this script."
+  Write-Host "Download URL:"
+  Write-Host "  https://www.docker.com/products/docker-desktop/"
+  Write-Host "Direct Windows installer:"
+  Write-Host "  https://desktop.docker.com/win/main/amd64/Docker%20Desktop%20Installer.exe"
+  exit 1
 }
 
 function Start-DockerDesktop {

@@ -20,6 +20,14 @@ This project includes:
 
 ## Windows Usage
 
+Docker Desktop is a required prerequisite.  
+Install it manually first (do not install from terminal commands):
+
+- Official page: `https://www.docker.com/products/docker-desktop/`
+- Direct Windows installer: `https://desktop.docker.com/win/main/amd64/Docker%20Desktop%20Installer.exe`
+
+After installing Docker Desktop, open it once and wait for **Engine running**.
+
 Run in **PowerShell as Administrator**:
 
 ```powershell
