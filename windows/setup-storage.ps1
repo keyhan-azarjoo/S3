@@ -325,7 +325,7 @@ function Ensure-IISInstalled {
   Info "IIS prerequisites installed successfully."
 }
 
-function Ensure-MinIONative([string]$root,[int]$apiPort,[int]$uiPort) {
+function Ensure-MinIONative([string]$root,[int]$apiPort,[int]$uiPort,[string]$publicUrl) {
   $binDir = Join-Path $root "minio"
   $dataDir = Join-Path $root "data"
   $exe = Join-Path $binDir "minio.exe"
@@ -337,6 +337,8 @@ function Ensure-MinIONative([string]$root,[int]$apiPort,[int]$uiPort) {
 
   [Environment]::SetEnvironmentVariable("MINIO_ROOT_USER","admin","Machine")
   [Environment]::SetEnvironmentVariable("MINIO_ROOT_PASSWORD","StrongPassword123","Machine")
+  [Environment]::SetEnvironmentVariable("MINIO_SERVER_URL",$publicUrl,"Machine")
+  [Environment]::SetEnvironmentVariable("MINIO_BROWSER_REDIRECT_URL",$publicUrl,"Machine")
 
   $taskName = "LocalS3-MinIO"
   $cmd = "`"$exe`" server `"$dataDir`" --address `":$apiPort`" --console-address `":$uiPort`""
@@ -375,6 +377,12 @@ function Ensure-IISProxyMode([string]$domain,[string]$siteRoot,[string]$certPath
 <?xml version="1.0" encoding="utf-8"?>
 <configuration>
   <system.webServer>
+    <webSocket enabled="true" />
+    <security>
+      <requestFiltering>
+        <requestLimits maxAllowedContentLength="4294967295" />
+      </requestFiltering>
+    </security>
     <rewrite>
       <rules>
         <rule name="ReverseProxyInboundRule1" stopProcessing="true">
@@ -390,6 +398,8 @@ function Ensure-IISProxyMode([string]$domain,[string]$siteRoot,[string]$certPath
 
   try {
     Set-WebConfigurationProperty -PSPath 'MACHINE/WEBROOT/APPHOST' -Filter "system.webServer/proxy" -Name "enabled" -Value "True" -ErrorAction Stop | Out-Null
+    Set-WebConfigurationProperty -PSPath 'MACHINE/WEBROOT/APPHOST' -Filter "system.webServer/proxy" -Name "preserveHostHeader" -Value "True" -ErrorAction Stop | Out-Null
+    Set-WebConfigurationProperty -PSPath 'MACHINE/WEBROOT/APPHOST' -Filter "system.webServer/proxy" -Name "reverseRewriteHostInResponseHeaders" -Value "False" -ErrorAction Stop | Out-Null
   } catch {
     Err "IIS reverse proxy is not available (ARR/URL Rewrite missing)."
     Warn "Install these IIS extensions, then rerun in IIS mode:"
@@ -479,8 +489,9 @@ function Install-IISMode {
     $uiPort = Resolve-RequiredPort -label "MinIO Console UI" -candidates @() -defaultPort ($apiPort + 1)
   }
 
+  $publicUrl = if ($httpsPort -eq 443) { "https://$domain" } else { "https://${domain}:$httpsPort" }
   Ensure-IISInstalled
-  Ensure-MinIONative -root $root -apiPort $apiPort -uiPort $uiPort
+  Ensure-MinIONative -root $root -apiPort $apiPort -uiPort $uiPort -publicUrl $publicUrl
   $crt = Join-Path $certDir "localhost.crt"
   $key = Join-Path $certDir "localhost.key"
   Ensure-IISProxyMode -domain $domain -siteRoot $siteRoot -certPath $crt -keyPath $key -httpsPort $httpsPort -targetPort $uiPort -lanIp $lanIp
