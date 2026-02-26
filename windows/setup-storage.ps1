@@ -455,17 +455,29 @@ function Install-IISMode {
     if ($lanIp) { Info "Detected LAN IP: $lanIp" } else { Warn "Could not detect LAN IP automatically." }
   }
 
-  $httpsPort = 443
-  if (-not (Port-Free $httpsPort)) {
-    Warn "Port 443 is already in use."
-    $httpsPort = Pick-Port @(8443,9443,10443)
-    if (-not $httpsPort) { Err "No free HTTPS port available."; exit 1 }
-    Warn "Using alternate HTTPS port: $httpsPort"
+  $busyDefaults = @()
+  foreach ($p in @(443,9000,9001)) {
+    if (-not (Port-Free $p)) { $busyDefaults += $p }
+  }
+  if ($busyDefaults.Count -gt 0 -and (Has-ExistingLocalS3IISInstall)) {
+    Warn ("Some default ports are busy (" + ($busyDefaults -join ", ") + ") and an existing LocalS3 IIS installation was detected.")
+    $ans = (Read-Host "Delete previous LocalS3 IIS install and reinstall now? (Y/n)").Trim().ToLowerInvariant()
+    if ($ans -eq "" -or $ans -eq "y" -or $ans -eq "yes") {
+      Remove-ExistingLocalS3IISInstall
+    } else {
+      Warn "Keeping existing LocalS3 install. Installer will use alternate/custom ports as needed."
+    }
   }
 
-  $apiPort = Pick-Port @(9000,19000,29000)
-  $uiPort = Pick-Port @(9001,19001,29001)
-  if (-not $apiPort -or -not $uiPort) { Err "No free MinIO ports available."; exit 1 }
+  $httpsPort = Resolve-HttpsPortForIIS
+  if ($httpsPort -ne 443) { Warn "Using HTTPS port: $httpsPort" }
+
+  $apiPort = Resolve-RequiredPort -label "MinIO API" -candidates @(9000,19000,29000,39000,49000,59000) -defaultPort 9000
+  $uiPort = Resolve-RequiredPort -label "MinIO Console UI" -candidates @(9001,19001,29001,39001,49001,59001) -defaultPort 9001
+  if ($uiPort -eq $apiPort) {
+    Warn "MinIO UI port cannot equal API port ($apiPort)."
+    $uiPort = Resolve-RequiredPort -label "MinIO Console UI" -candidates @() -defaultPort ($apiPort + 1)
+  }
 
   Ensure-IISInstalled
   Ensure-MinIONative -root $root -apiPort $apiPort -uiPort $uiPort
@@ -740,6 +752,85 @@ function Prompt-CleanupPreviousServers([string]$dockerCtx) {
 function Pick-Port([int[]]$candidates) {
   foreach ($p in $candidates) { if (Port-Free $p) { return $p } }
   return $null
+}
+
+function Resolve-RequiredPort([string]$label, [int[]]$candidates, [int]$defaultPort) {
+  $picked = Pick-Port $candidates
+  if ($picked) { return [int]$picked }
+
+  Warn "No free default port found for $label."
+  while ($true) {
+    $raw = (Read-Host "Enter custom port for $label (1-65535, default: $defaultPort)").Trim()
+    if ([string]::IsNullOrWhiteSpace($raw)) { $raw = "$defaultPort" }
+    $port = 0
+    if (-not [int]::TryParse($raw, [ref]$port)) {
+      Warn "Invalid number: $raw"
+      continue
+    }
+    if ($port -lt 1 -or $port -gt 65535) {
+      Warn "Port must be between 1 and 65535."
+      continue
+    }
+    if (-not (Port-Free $port)) {
+      Warn "Port $port is already in use."
+      continue
+    }
+    return $port
+  }
+}
+
+function Resolve-HttpsPortForIIS {
+  if (Port-Free 443) {
+    $use443 = (Read-Host "Use HTTPS port 443? (Y/n)").Trim().ToLowerInvariant()
+    if ($use443 -eq "" -or $use443 -eq "y" -or $use443 -eq "yes") {
+      return 443
+    }
+  } else {
+    Warn "Port 443 is already in use."
+  }
+
+  $choice = (Read-Host "Choose HTTPS port: 1) auto alternate 2) custom port (default: 1)").Trim()
+  if ($choice -eq "2") {
+    return Resolve-RequiredPort -label "HTTPS (IIS)" -candidates @() -defaultPort 8443
+  }
+  return Resolve-RequiredPort -label "HTTPS (IIS)" -candidates @(8443,9443,10443,11443,12443) -defaultPort 8443
+}
+
+function Has-ExistingLocalS3IISInstall {
+  $exists = $false
+  try {
+    Import-Module WebAdministration -ErrorAction SilentlyContinue
+    if (Test-Path "IIS:\Sites\LocalS3-IIS") { $exists = $true }
+  } catch {}
+
+  $prev = $ErrorActionPreference
+  $ErrorActionPreference = "Continue"
+  schtasks /Query /TN "LocalS3-MinIO" 1>$null 2>$null
+  if ($LASTEXITCODE -eq 0) { $exists = $true }
+  $ErrorActionPreference = $prev
+
+  return $exists
+}
+
+function Remove-ExistingLocalS3IISInstall {
+  Info "Removing existing LocalS3 IIS installation..."
+  $prev = $ErrorActionPreference
+  $ErrorActionPreference = "Continue"
+
+  try {
+    Import-Module WebAdministration -ErrorAction SilentlyContinue
+    if (Test-Path "IIS:\Sites\LocalS3-IIS") {
+      Stop-Website -Name "LocalS3-IIS" 2>$null | Out-Null
+      Remove-Website -Name "LocalS3-IIS" 2>$null | Out-Null
+    }
+  } catch {}
+
+  schtasks /End /TN "LocalS3-MinIO" 1>$null 2>$null | Out-Null
+  schtasks /Delete /TN "LocalS3-MinIO" /F 1>$null 2>$null | Out-Null
+
+  Get-Process -Name "minio" -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
+  $ErrorActionPreference = $prev
+  Start-Sleep -Seconds 2
 }
 
 function Get-LanIPv4 {
