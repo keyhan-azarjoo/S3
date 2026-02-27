@@ -335,7 +335,7 @@ function Ensure-IISInstalled {
   $features = @(
     "IIS-WebServerRole","IIS-WebServer","IIS-CommonHttpFeatures","IIS-DefaultDocument",
     "IIS-StaticContent","IIS-HttpErrors","IIS-HttpRedirect","IIS-ApplicationDevelopment",
-    "IIS-ISAPIExtensions","IIS-ISAPIFilter","IIS-ManagementConsole"
+    "IIS-ISAPIExtensions","IIS-ISAPIFilter","IIS-ManagementConsole","IIS-WebSockets"
   )
   foreach ($f in $features) { Ensure-FeatureLocal $f }
 
@@ -540,6 +540,11 @@ function Ensure-IISProxyMode([string]$domain,[string]$siteRoot,[string]$certPath
       <rules>
         <rule name="ReverseProxyInboundRule1" stopProcessing="true">
           <match url="(.*)" />
+          <serverVariables>
+            <set name="HTTP_X_FORWARDED_PROTO" value="https" />
+            <set name="HTTP_X_FORWARDED_HOST" value="{HTTP_HOST}" />
+            <set name="HTTP_X_FORWARDED_FOR" value="{REMOTE_ADDR}" />
+          </serverVariables>
           <action type="Rewrite" url="http://127.0.0.1:$targetPort/{R:1}" />
         </rule>
       </rules>
@@ -553,6 +558,7 @@ function Ensure-IISProxyMode([string]$domain,[string]$siteRoot,[string]$certPath
     Set-WebConfigurationProperty -PSPath 'MACHINE/WEBROOT/APPHOST' -Filter "system.webServer/proxy" -Name "enabled" -Value "True" -ErrorAction Stop | Out-Null
     Set-WebConfigurationProperty -PSPath 'MACHINE/WEBROOT/APPHOST' -Filter "system.webServer/proxy" -Name "preserveHostHeader" -Value "True" -ErrorAction Stop | Out-Null
     Set-WebConfigurationProperty -PSPath 'MACHINE/WEBROOT/APPHOST' -Filter "system.webServer/proxy" -Name "reverseRewriteHostInResponseHeaders" -Value "False" -ErrorAction Stop | Out-Null
+    Set-WebConfigurationProperty -PSPath 'MACHINE/WEBROOT/APPHOST' -Filter "system.webServer/proxy" -Name "allowSslOffloading" -Value "True" -ErrorAction Stop | Out-Null
   } catch {
     Err "IIS reverse proxy is not available (ARR/URL Rewrite missing)."
     Warn "Install these IIS extensions, then rerun in IIS mode:"
@@ -562,7 +568,10 @@ function Ensure-IISProxyMode([string]$domain,[string]$siteRoot,[string]$certPath
   }
 
   $certDns = @("localhost",$domain) | Select-Object -Unique
-  $cert = New-SelfSignedCertificate -DnsName $certDns -CertStoreLocation "Cert:\LocalMachine\My" -NotAfter (Get-Date).AddYears(2)
+  $san = "2.5.29.17={text}DNS=localhost"
+  if ($domain -and $domain -ne "localhost") { $san += "&DNS=$domain" }
+  if ($lanIp) { $san += "&IP=$lanIp" }
+  $cert = New-SelfSignedCertificate -DnsName $certDns -TextExtension $san -CertStoreLocation "Cert:\LocalMachine\My" -NotAfter (Get-Date).AddYears(2)
   $thumb = $cert.Thumbprint
   Import-Certificate -FilePath (Export-Certificate -Cert "Cert:\LocalMachine\My\$thumb" -FilePath $certPath -Force).FullName -CertStoreLocation "Cert:\LocalMachine\Root" | Out-Null
 
