@@ -20,6 +20,88 @@ function Info($m){ Write-Host "[INFO] $m" }
 function Warn($m){ Write-Host "[WARN] $m" -ForegroundColor Yellow }
 function Err ($m){ Write-Host "[ERROR] $m" -ForegroundColor Red }
 
+# ---------------------------------------------------------------------------
+# Utility: generic retry with optional exponential back-off
+# ---------------------------------------------------------------------------
+function Retry-Operation {
+  param(
+    [scriptblock]$Action,
+    [string]$Name = "operation",
+    [int]$MaxAttempts = 3,
+    [int]$DelaySeconds = 2,
+    [switch]$Exponential
+  )
+  $attempt = 0
+  while ($attempt -lt $MaxAttempts) {
+    $attempt++
+    try {
+      return (& $Action)
+    } catch {
+      if ($attempt -lt $MaxAttempts) {
+        $wait = if ($Exponential) { [int]($DelaySeconds * [Math]::Pow(2, $attempt - 1)) } else { $DelaySeconds }
+        Warn "[$Name] attempt $attempt/$MaxAttempts failed: $($_.Exception.Message). Retrying in ${wait}s..."
+        Start-Sleep -Seconds $wait
+      } else {
+        Warn "[$Name] all $MaxAttempts attempts failed. Last error: $($_.Exception.Message)"
+        throw
+      }
+    }
+  }
+}
+
+# ---------------------------------------------------------------------------
+# Utility: internet reachability check (ping + TCP fallback)
+# ---------------------------------------------------------------------------
+function Test-NetworkConnectivity {
+  foreach ($ip in @("8.8.8.8","1.1.1.1","208.67.222.222")) {
+    try {
+      $ping = New-Object System.Net.NetworkInformation.Ping
+      if ($ping.Send($ip, 3000).Status -eq "Success") { return $true }
+    } catch {}
+  }
+  foreach ($hostPort in @("github.com:443","docker.com:443")) {
+    $parts = $hostPort.Split(":")
+    if (Test-TcpPort -targetHost $parts[0] -port ([int]$parts[1]) -timeoutMs 4000) { return $true }
+  }
+  return $false
+}
+
+# ---------------------------------------------------------------------------
+# Utility: disk free-space check
+# ---------------------------------------------------------------------------
+function Test-DiskSpace {
+  param([string]$Path = $env:SystemDrive, [int]$MinGB = 5)
+  try {
+    $drive = Split-Path -Qualifier $Path -ErrorAction SilentlyContinue
+    if (-not $drive) { $drive = $env:SystemDrive }
+    $disk = Get-PSDrive -Name ($drive.TrimEnd(':')) -ErrorAction SilentlyContinue
+    if ($disk) {
+      $freeGB = [Math]::Round($disk.Free / 1GB, 1)
+      if ($freeGB -lt $MinGB) {
+        Warn "Low disk space on ${drive}: ${freeGB} GB free (need at least $MinGB GB)."
+        return $false
+      }
+      Info "Disk space OK: ${freeGB} GB free on ${drive}."
+    }
+  } catch {}
+  return $true
+}
+
+# ---------------------------------------------------------------------------
+# Pre-flight: disk space + network connectivity
+# ---------------------------------------------------------------------------
+function Run-PreflightChecks {
+  param([string]$DataPath = "")
+  Info "Running pre-flight checks..."
+  $checkPath = if ($DataPath) { $DataPath } else { $env:SystemDrive }
+  Test-DiskSpace -Path $checkPath -MinGB 5 | Out-Null
+  if (-not (Test-NetworkConnectivity)) {
+    Warn "No internet connectivity detected. Downloads may fail if Docker images are not cached."
+  } else {
+    Info "Network connectivity: OK"
+  }
+}
+
 function Initialize-NetworkDefaults {
   try {
     $tls12 = [Net.SecurityProtocolType]::Tls12
@@ -237,6 +319,93 @@ function Test-MinIOAdminLogin([int]$uiPort, [string]$accessKey = "admin", [strin
   } catch {
     return $false
   }
+}
+
+# ---------------------------------------------------------------------------
+# Post-install: create buckets, set policies, configure CORS, service account
+# ---------------------------------------------------------------------------
+function Configure-MinIOFeatures {
+  param([int]$ApiPort, [int]$UiPort)
+  Info "Configuring MinIO features (buckets, CORS, policies, service accounts)..."
+
+  # ---- login ----
+  $loginBody = @{ accessKey = $Script:ActiveAccessKey; secretKey = $Script:ActiveSecretKey } | ConvertTo-Json -Compress
+  $session = $null
+  try {
+    Invoke-WebRequest -Uri "http://127.0.0.1:$UiPort/api/v1/login" -Method Post `
+      -ContentType "application/json" -Body $loginBody -UseBasicParsing `
+      -TimeoutSec 15 -SessionVariable "minioSess" | Out-Null
+    $session = $minioSess
+    Info "MinIO console login OK."
+  } catch {
+    Warn "Could not log in to MinIO console API: $($_.Exception.Message)"
+    Warn "Skipping feature configuration. Log in manually at http://localhost:$UiPort"
+    return
+  }
+
+  # ---- helper ----
+  function Invoke-MinioApi([string]$Path, [string]$Method = "GET", [object]$Body = $null) {
+    $uri = "http://127.0.0.1:$UiPort/api/v1$Path"
+    $p = @{ Uri = $uri; Method = $Method; UseBasicParsing = $true; WebSession = $session; TimeoutSec = 15 }
+    if ($Body) { $p.ContentType = "application/json"; $p.Body = ($Body | ConvertTo-Json -Compress -Depth 10) }
+    return Invoke-WebRequest @p
+  }
+
+  # ---- buckets ----
+  $bucketsWanted = @("images", "documents", "backups")
+  $existingBuckets = @()
+  try {
+    $data = (Invoke-MinioApi -Path "/buckets").Content | ConvertFrom-Json
+    if ($data.buckets) { $existingBuckets = $data.buckets | Select-Object -ExpandProperty name }
+  } catch { Warn "Could not list buckets: $($_.Exception.Message)" }
+
+  foreach ($bk in $bucketsWanted) {
+    if ($existingBuckets -contains $bk) {
+      Info "Bucket '$bk' already exists."
+    } else {
+      try {
+        $bucketBody = @{ name = $bk; versioning = @{ enabled = $false }; locking = $false }
+        Invoke-MinioApi -Path "/buckets" -Method "POST" -Body $bucketBody | Out-Null
+        Info "Created bucket: $bk"
+      } catch { Warn "Could not create bucket '${bk}': $($_.Exception.Message)" }
+    }
+  }
+
+  # ---- public read on 'images' ----
+  try {
+    Invoke-MinioApi -Path "/buckets/images/access" -Method "PUT" -Body @{ access = "public"; definition = @{} } | Out-Null
+    Info "Set 'images' bucket to public-read."
+  } catch { Warn "Could not set public-read on 'images': $($_.Exception.Message)" }
+
+  # ---- CORS on 'images' ----
+  try {
+    $corsBody = @{
+      corsRules = @(
+        @{
+          allowedHeaders = @("*")
+          allowedMethods = @("GET","HEAD","PUT","POST","DELETE")
+          allowedOrigins = @("*")
+          exposeHeaders  = @("ETag","Content-Type","x-amz-request-id")
+          maxAgeSeconds  = 3600
+        }
+      )
+    }
+    Invoke-MinioApi -Path "/buckets/images/cors" -Method "PUT" -Body $corsBody | Out-Null
+    Info "Configured CORS on 'images' bucket."
+  } catch { Warn "CORS config skipped (may not be supported in this MinIO build): $($_.Exception.Message)" }
+
+  # ---- read-only service account for apps ----
+  try {
+    $svcPolicy = '{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Action":["s3:GetObject","s3:GetObjectVersion","s3:ListBucket","s3:ListBucketVersions"],"Resource":["arn:aws:s3:::images","arn:aws:s3:::images/*","arn:aws:s3:::documents","arn:aws:s3:::documents/*"]}]}'
+    $svcBody = @{ policy = $svcPolicy; accessKey = "readonly-app"; secretKey = "ReadOnly#App2024!" }
+    Invoke-MinioApi -Path "/service-accounts" -Method "POST" -Body $svcBody | Out-Null
+    Info "Created service account: readonly-app"
+  } catch { Warn "Service account creation skipped: $($_.Exception.Message)" }
+
+  Info "MinIO feature configuration complete."
+  Write-Host ""
+  Write-Host "Pre-configured buckets  : images (public-read + CORS), documents, backups"
+  Write-Host "Read-only service account: readonly-app / ReadOnly#App2024!"
 }
 
 function Test-MinIOHealth([int]$apiPort) {
@@ -750,6 +919,8 @@ function Install-IISMode {
     $uiPort = Resolve-RequiredPort -label "MinIO Console UI" -candidates @() -defaultPort ($apiPort + 1)
   }
 
+  Run-PreflightChecks -DataPath $root
+
   $publicUrl = if ($httpsPort -eq 443) { "https://$domain" } else { "https://${domain}:$httpsPort" }
   Ensure-IISInstalled
   Ensure-MinIONative -root $root -apiPort $apiPort -uiPort $uiPort -publicUrl $publicUrl
@@ -757,22 +928,27 @@ function Install-IISMode {
   $key = Join-Path $certDir "localhost.key"
   Ensure-IISProxyMode -domain $domain -siteRoot $siteRoot -certPath $crt -keyPath $key -httpsPort $httpsPort -targetPort $uiPort -lanIp $lanIp
 
+  # Auto-configure buckets, CORS, service accounts
+  Configure-MinIOFeatures -ApiPort $apiPort -UiPort $uiPort
+
   Write-Host ""
   Write-Host "===== INSTALLATION COMPLETE (IIS MODE) ====="
-  Write-Host "MinIO Console (direct): http://localhost:$uiPort"
-  Write-Host "MinIO API (direct):     http://localhost:$apiPort"
+  Write-Host ""
+  Write-Host "URLs:"
+  Write-Host "  MinIO Console (direct): http://localhost:$uiPort"
+  Write-Host "  MinIO API (direct):     http://localhost:$apiPort"
   if ($httpsPort -eq 443) {
-    Write-Host "IIS Proxy URL:          https://$domain"
+    Write-Host "  IIS Proxy URL:          https://$domain"
   } else {
-    Write-Host "IIS Proxy URL:          https://${domain}:$httpsPort"
+    Write-Host "  IIS Proxy URL:          https://${domain}:$httpsPort"
   }
   if ($enableLan -and $lanIp) {
     if ($httpsPort -eq 443) {
-      Write-Host "LAN URL:                https://$lanIp"
+      Write-Host "  LAN URL:                https://$lanIp"
     } else {
-      Write-Host "LAN URL:                https://${lanIp}:$httpsPort"
+      Write-Host "  LAN URL:                https://${lanIp}:$httpsPort"
     }
-    Write-Host "For DNS: map $domain -> $lanIp"
+    Write-Host "  For DNS: map $domain -> $lanIp"
     if (-not $Script:IISCertIncludesIpSan) {
       Warn "TLS cert does not include LAN IP SAN on this Windows build."
       Warn "Use the domain URL for HTTPS. LAN-IP URL may show certificate name mismatch."
@@ -780,8 +956,17 @@ function Install-IISMode {
   }
   Write-Host ""
   Write-Host "Login:"
-  Write-Host "  Username: $Script:ActiveAccessKey"
-  Write-Host "  Password: $Script:ActiveSecretKey"
+  Write-Host "  Username : $Script:ActiveAccessKey"
+  Write-Host "  Password : $Script:ActiveSecretKey"
+  Write-Host ""
+  Write-Host "Pre-configured buckets:"
+  Write-Host "  images    (public-read + CORS enabled)"
+  Write-Host "  documents"
+  Write-Host "  backups"
+  Write-Host ""
+  Write-Host "Read-only service account (for apps / SDKs):"
+  Write-Host "  Access key : readonly-app"
+  Write-Host "  Secret key : ReadOnly#App2024!"
 }
 
 function Enable-WSLFeatures {
@@ -882,6 +1067,63 @@ function Test-DockerEngine {
   return $ok
 }
 
+# ---------------------------------------------------------------------------
+# Self-healing: terminate stuck WSL distros + restart Docker Desktop
+# ---------------------------------------------------------------------------
+function Repair-DockerEngine {
+  Info "Attempting Docker Engine self-repair..."
+  $prev = $ErrorActionPreference
+  $ErrorActionPreference = "Continue"
+
+  # Step 1: Terminate docker-desktop WSL distros
+  try {
+    $wslOut = wsl --list --quiet 2>$null
+    if ($wslOut) {
+      $distros = $wslOut | Where-Object { ($_ -replace '[^\x20-\x7E]','').Trim() -match "docker-desktop" }
+      if ($distros) {
+        Info "Terminating stuck Docker WSL distros..."
+        foreach ($d in $distros) {
+          $dName = ($d -replace '[^\x20-\x7E]','').Trim()
+          if ($dName) {
+            wsl --terminate $dName 2>$null | Out-Null
+            Info "  Terminated: $dName"
+          }
+        }
+        Start-Sleep -Seconds 4
+      }
+    }
+  } catch {
+    Warn "WSL distro enumeration failed: $($_.Exception.Message)"
+  }
+
+  # Step 2: Kill and restart Docker Desktop
+  try {
+    $dd = Get-Process "Docker Desktop" -ErrorAction SilentlyContinue
+    if ($dd) {
+      Info "Stopping Docker Desktop process..."
+      $dd | Stop-Process -Force -ErrorAction SilentlyContinue
+      Start-Sleep -Seconds 6
+    }
+  } catch {}
+  Start-DockerDesktop
+  $ErrorActionPreference = $prev
+
+  # Step 3: Wait up to 120s for recovery
+  Info "Waiting for Docker Engine recovery (up to 120s)..."
+  $elapsed = 0
+  while ($elapsed -lt 120) {
+    Start-Sleep -Seconds 5
+    $elapsed += 5
+    if (Test-DockerEngine) {
+      Info "Docker Engine recovered after self-repair ($elapsed s)."
+      return $true
+    }
+    if ($elapsed % 30 -eq 0) { Info "  Still waiting... ($elapsed/120s)" }
+  }
+  Warn "Docker Engine did not recover after self-repair."
+  return $false
+}
+
 function Wait-DockerEngine {
   Info "Checking Docker Engine availability..."
   if (Test-DockerEngine) {
@@ -892,10 +1134,10 @@ function Wait-DockerEngine {
   Warn "Docker Engine not reachable. Attempting to start Docker Desktop..."
   Start-DockerDesktop
 
-  $maxSeconds = 180
+  # Phase 1: wait 90 seconds normally
+  $maxSeconds = 90
   $step = 5
   $elapsed = 0
-
   while ($elapsed -lt $maxSeconds) {
     Start-Sleep -Seconds $step
     $elapsed += $step
@@ -903,15 +1145,20 @@ function Wait-DockerEngine {
       Info "Docker Engine is ready."
       return
     }
+    if ($elapsed % 30 -eq 0) { Info "Waiting for Docker Engine... ($elapsed/${maxSeconds}s)" }
   }
 
-  Err "Docker Engine is still NOT reachable after waiting."
-  Warn "Run these checks (in Admin PowerShell):"
-  Write-Host "  wsl --status"
-  Write-Host "  wsl --install"
-  Write-Host "  wsl --shutdown"
-  Warn "Then open Docker Desktop and wait until it says 'Engine running'."
-  Warn "If virtualization is disabled, enable it in BIOS (Intel VT-x / AMD SVM)."
+  # Phase 2: attempt self-repair
+  Warn "Docker Engine not ready after ${maxSeconds}s. Starting self-repair procedure..."
+  $repaired = Repair-DockerEngine
+  if ($repaired) { return }
+
+  Err "Docker Engine is still NOT reachable after repair attempts."
+  Warn "Manual recovery steps:"
+  Write-Host "  1. Open Docker Desktop and wait for 'Engine running'"
+  Write-Host "  2. Run: wsl --shutdown  then reopen Docker Desktop"
+  Write-Host "  3. If new: wsl --install (then reboot)"
+  Write-Host "  4. Ensure virtualization is enabled in BIOS (Intel VT-x / AMD SVM)"
   exit 1
 }
 
@@ -1356,6 +1603,7 @@ function Write-FilesAndUp {
   New-Item -ItemType Directory -Force -Path $ngcerts | Out-Null
   New-Item -ItemType Directory -Force -Path $data | Out-Null
 
+  Run-PreflightChecks -DataPath $data
   Info "Project folder: $project"
 
   $compose = @"
@@ -1370,12 +1618,24 @@ services:
     environment:
       MINIO_ROOT_USER: admin
       MINIO_ROOT_PASSWORD: StrongPassword123
+      MINIO_PROMETHEUS_AUTH_TYPE: public
+      MINIO_BROWSER_REDIRECT_URL: ""
     volumes:
       - ./data:/data
     ports:
       - "$minioApi:9000"
       - "$minioUI:9001"
     restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:9000/minio/health/live"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 30s
+    deploy:
+      resources:
+        limits:
+          memory: 1g
 
   nginx:
     image: nginx:latest
@@ -1389,28 +1649,69 @@ services:
       - ./nginx/conf:/etc/nginx/conf.d:ro
       - ./nginx/certs:/etc/nginx/certs:ro
     depends_on:
-      - minio
+      minio:
+        condition: service_healthy
     restart: unless-stopped
 "@
 
   $serverNames = if ($domain -eq "localhost") { "localhost" } else { "$domain localhost" }
   $nginx = @"
+# Gzip compression
+gzip on;
+gzip_types text/plain text/css application/json application/javascript text/xml application/xml application/octet-stream;
+gzip_min_length 1024;
+gzip_vary on;
+
 server {
-    listen 443 ssl;
+    listen 443 ssl http2;
     server_name $serverNames;
-    ssl_certificate /etc/nginx/certs/localhost.crt;
+
+    ssl_certificate     /etc/nginx/certs/localhost.crt;
     ssl_certificate_key /etc/nginx/certs/localhost.key;
 
+    # TLS hardening
+    ssl_protocols       TLSv1.2 TLSv1.3;
+    ssl_ciphers         HIGH:!aNULL:!MD5;
+    ssl_prefer_server_ciphers on;
+    ssl_session_cache   shared:SSL:10m;
+    ssl_session_timeout 10m;
+
+    # Security headers
+    add_header Strict-Transport-Security "max-age=31536000; includeSubDomains" always;
+    add_header X-Frame-Options SAMEORIGIN always;
+    add_header X-Content-Type-Options nosniff always;
+    add_header X-XSS-Protection "1; mode=block" always;
+    add_header Referrer-Policy no-referrer-when-downgrade always;
+
+    # Allow large file uploads (up to 5 GB)
+    client_max_body_size 5g;
+
+    # MinIO Console (web dashboard + WebSocket)
     location / {
-        proxy_pass http://minio:9001;
+        proxy_pass         http://minio:9001;
         proxy_http_version 1.1;
-        proxy_set_header Host `$http_host;
-        proxy_set_header X-Real-IP `$remote_addr;
+        proxy_set_header Host            `$http_host;
+        proxy_set_header X-Real-IP       `$remote_addr;
         proxy_set_header X-Forwarded-For `$proxy_add_x_forwarded_for;
         proxy_set_header X-Forwarded-Proto https;
-        proxy_set_header Upgrade `$http_upgrade;
-        proxy_set_header Connection "upgrade";
+        proxy_set_header Upgrade         `$http_upgrade;
+        proxy_set_header Connection      "upgrade";
         proxy_read_timeout 3600;
+        proxy_buffering    off;
+    }
+
+    # MinIO S3 API (for SDK / CLI / programmatic access via /s3/)
+    location /s3/ {
+        rewrite ^/s3/(.*) /`$1 break;
+        proxy_pass         http://minio:9000;
+        proxy_http_version 1.1;
+        proxy_set_header Host            `$http_host;
+        proxy_set_header X-Real-IP       `$remote_addr;
+        proxy_set_header X-Forwarded-For `$proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto https;
+        proxy_read_timeout 3600;
+        proxy_buffering    off;
+        client_max_body_size 5g;
     }
 }
 "@
@@ -1512,30 +1813,42 @@ server {
   }
   Info "MinIO is healthy and accepting requests."
 
+  # Auto-configure buckets, CORS, service accounts
+  Configure-MinIOFeatures -ApiPort $minioApi -UiPort $minioUI
+
   Pop-Location
 
+  $proxyUrl = if ($nginxHttps -eq 443) { "https://$domain" } else { "https://${domain}:$nginxHttps" }
   Write-Host ""
   Write-Host "===== INSTALLATION COMPLETE ====="
-  Write-Host "MinIO Console: http://localhost:$minioUI"
-  Write-Host "MinIO API:     http://localhost:$minioApi"
-  $proxyUrl = if ($nginxHttps -eq 443) { "https://$domain" } else { "https://${domain}:$nginxHttps" }
-  Write-Host "Proxy URL:     $proxyUrl"
+  Write-Host ""
+  Write-Host "URLs:"
+  Write-Host "  MinIO Console (dashboard): http://localhost:$minioUI"
+  Write-Host "  MinIO API (S3):            http://localhost:$minioApi"
+  Write-Host "  HTTPS Proxy (console):     $proxyUrl"
+  Write-Host "  HTTPS S3 API route:        $proxyUrl/s3/"
   if ($enableLan -and $lanIp) {
     $lanUrl = if ($nginxHttps -eq 443) { "https://$lanIp" } else { "https://${lanIp}:$nginxHttps" }
-    Write-Host "LAN URL:       $lanUrl"
+    Write-Host "  LAN URL:                   $lanUrl"
   }
   Write-Host ""
-  Write-Host "TLS note:"
-  Write-Host "  Self-signed cert has been trusted in LocalMachine\\Root."
-  Write-Host ""
   Write-Host "Login:"
-  Write-Host "  Username: admin"
-  Write-Host "  Password: StrongPassword123"
+  Write-Host "  Username : admin"
+  Write-Host "  Password : StrongPassword123"
   Write-Host ""
-  Write-Host "Next: open MinIO Console, create bucket: images"
+  Write-Host "Pre-configured buckets:"
+  Write-Host "  images    (public-read + CORS enabled)"
+  Write-Host "  documents"
+  Write-Host "  backups"
+  Write-Host ""
+  Write-Host "Read-only service account (for apps / SDKs):"
+  Write-Host "  Access key : readonly-app"
+  Write-Host "  Secret key : ReadOnly#App2024!"
+  Write-Host ""
+  Write-Host "TLS: Self-signed cert trusted in LocalMachine\Root."
   if ($enableLan -and $lanIp) {
     Write-Host ""
-    Write-Host "For other computers:"
+    Write-Host "For other computers on the LAN:"
     if ($domain -ne "localhost") {
       Write-Host "  Add hosts entry: $lanIp $domain"
       if ($nginxHttps -eq 443) {
@@ -1550,8 +1863,7 @@ server {
         Write-Host "  Open: https://${lanIp}:$nginxHttps"
       }
     }
-    Write-Host "  Trust cert file on client (optional, avoids warning):"
-    Write-Host "  $($ngcerts)\localhost.crt"
+    Write-Host "  Trust cert on client: $($ngcerts)\localhost.crt"
   }
 }
 
