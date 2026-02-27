@@ -442,10 +442,34 @@ function Ensure-MinIONative([string]$root,[int]$apiPort,[int]$uiPort,[string]$pu
     }
   }
   if (-not $downloaded) {
-    Err "Failed to download MinIO binary."
+    Warn "Automatic MinIO download failed from all sources."
     if ($lastDownloadError) { Warn "Last download error: $lastDownloadError" }
-    Warn "Check outbound HTTPS access to: dl.min.io and github.com, or place minio.exe manually at: $exe"
-    exit 1
+    Warn "Check outbound HTTPS access to: dl.min.io and github.com."
+    $manualPath = (Read-Host "Enter full path to a local minio.exe (or press Enter to abort)").Trim()
+    if (-not [string]::IsNullOrWhiteSpace($manualPath)) {
+      if (Test-Path $manualPath) {
+        try {
+          Copy-Item -Path $manualPath -Destination $exe -Force
+          if ((Test-Path $exe) -and ((Get-Item $exe).Length -gt 10000000)) {
+            $downloaded = $true
+            Info "Using local MinIO binary: $manualPath"
+          } else {
+            Err "Provided file is too small to be a valid MinIO binary."
+            exit 1
+          }
+        } catch {
+          Err "Failed to copy local MinIO binary: $($_.Exception.Message)"
+          exit 1
+        }
+      } else {
+        Err "Local MinIO binary path not found: $manualPath"
+        exit 1
+      }
+    } else {
+      Err "Failed to download MinIO binary."
+      Warn "Place minio.exe at: $exe and rerun installer."
+      exit 1
+    }
   }
   try {
     $ver = & $exe --version 2>$null | Select-Object -First 1
@@ -768,6 +792,9 @@ function Enable-WSLFeatures {
   if ($wsl -ne "Enabled") {
     Info "Enabling Microsoft-Windows-Subsystem-Linux..."
     dism /online /enable-feature /featurename:Microsoft-Windows-Subsystem-Linux /all /norestart | Out-Null
+    if ($LASTEXITCODE -ne 0) {
+      Warn "DISM failed to enable Microsoft-Windows-Subsystem-Linux (exit $LASTEXITCODE). You may need to enable it manually."
+    }
     $needRestart = $true
   }
 
@@ -775,6 +802,9 @@ function Enable-WSLFeatures {
   if ($vmp -ne "Enabled") {
     Info "Enabling VirtualMachinePlatform..."
     dism /online /enable-feature /featurename:VirtualMachinePlatform /all /norestart | Out-Null
+    if ($LASTEXITCODE -ne 0) {
+      Warn "DISM failed to enable VirtualMachinePlatform (exit $LASTEXITCODE). You may need to enable it manually."
+    }
     $needRestart = $true
   }
 
@@ -811,13 +841,25 @@ function Ensure-DockerInstalled {
     return
   }
 
-  Err "Docker CLI not found."
-  Warn "Please install Docker Desktop manually, then rerun this script."
-  Write-Host "Download URL:"
-  Write-Host "  https://www.docker.com/products/docker-desktop/"
-  Write-Host "Direct Windows installer:"
-  Write-Host "  https://desktop.docker.com/win/main/amd64/Docker%20Desktop%20Installer.exe"
-  exit 1
+  Warn "Docker CLI not found. Attempting automatic installation..."
+  $ok = Install-DockerDesktopDirect
+  if (-not $ok) {
+    Err "Automatic Docker Desktop installation failed."
+    Warn "Please install Docker Desktop manually, then rerun this script."
+    Write-Host "Download URL:"
+    Write-Host "  https://www.docker.com/products/docker-desktop/"
+    Write-Host "Direct Windows installer:"
+    Write-Host "  https://desktop.docker.com/win/main/amd64/Docker%20Desktop%20Installer.exe"
+    exit 1
+  }
+  # After silent install, refresh PATH and recheck
+  Try-EnableDockerCliFromDefaultPath
+  if (-not (Has-Cmd "docker")) {
+    Warn "Docker CLI still not in PATH after install. A Windows restart may be required."
+    Mark-RestartRequired "Docker Desktop installed - PATH update pending"
+    return
+  }
+  Info "Docker Desktop installed successfully."
 }
 
 function Start-DockerDesktop {
@@ -1266,7 +1308,6 @@ function Write-FilesAndUp {
     } else {
       Info "Detected LAN IP: $lanIp"
     }
-    Ensure-FirewallPort -port 443
   }
 
   # Resolve Docker context early so we can clean up previous installer containers if needed.
@@ -1440,6 +1481,36 @@ server {
     Pop-Location
     exit 1
   }
+
+  # Wait for MinIO API port to be reachable before declaring success
+  Info "Waiting for MinIO to become ready..."
+  if (-not (Wait-TcpPort -targetHost "127.0.0.1" -port $minioApi -maxSeconds 60)) {
+    Warn "MinIO API port $minioApi did not become ready in 60 seconds."
+    $ErrorActionPreference = "Continue"
+    if ($usedFallback) {
+      docker --context $dockerCtx logs --tail 80 minio 2>&1
+    } else {
+      docker --context $dockerCtx compose logs --no-color --tail 80 minio 2>&1
+    }
+    $ErrorActionPreference = $prev
+    Pop-Location
+    Err "MinIO did not start in time. Check container logs above."
+    exit 1
+  }
+  if (-not (Test-MinIOHealth -apiPort $minioApi)) {
+    Warn "MinIO port $minioApi is open but health check failed."
+    $ErrorActionPreference = "Continue"
+    if ($usedFallback) {
+      docker --context $dockerCtx logs --tail 80 minio 2>&1
+    } else {
+      docker --context $dockerCtx compose logs --no-color --tail 80 minio 2>&1
+    }
+    $ErrorActionPreference = $prev
+    Pop-Location
+    Err "MinIO health check failed. Check container logs above."
+    exit 1
+  }
+  Info "MinIO is healthy and accepting requests."
 
   Pop-Location
 
