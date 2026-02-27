@@ -558,7 +558,11 @@ function Ensure-IISProxyMode([string]$domain,[string]$siteRoot,[string]$certPath
     Set-WebConfigurationProperty -PSPath 'MACHINE/WEBROOT/APPHOST' -Filter "system.webServer/proxy" -Name "enabled" -Value "True" -ErrorAction Stop | Out-Null
     Set-WebConfigurationProperty -PSPath 'MACHINE/WEBROOT/APPHOST' -Filter "system.webServer/proxy" -Name "preserveHostHeader" -Value "True" -ErrorAction Stop | Out-Null
     Set-WebConfigurationProperty -PSPath 'MACHINE/WEBROOT/APPHOST' -Filter "system.webServer/proxy" -Name "reverseRewriteHostInResponseHeaders" -Value "False" -ErrorAction Stop | Out-Null
-    Set-WebConfigurationProperty -PSPath 'MACHINE/WEBROOT/APPHOST' -Filter "system.webServer/proxy" -Name "allowSslOffloading" -Value "True" -ErrorAction Stop | Out-Null
+    try {
+      Set-WebConfigurationProperty -PSPath 'MACHINE/WEBROOT/APPHOST' -Filter "system.webServer/proxy" -Name "allowSslOffloading" -Value "True" -ErrorAction Stop | Out-Null
+    } catch {
+      Warn "ARR property 'allowSslOffloading' is not available on this IIS version. Continuing."
+    }
   } catch {
     Err "IIS reverse proxy is not available (ARR/URL Rewrite missing)."
     Warn "Install these IIS extensions, then rerun in IIS mode:"
@@ -568,10 +572,20 @@ function Ensure-IISProxyMode([string]$domain,[string]$siteRoot,[string]$certPath
   }
 
   $certDns = @("localhost",$domain) | Select-Object -Unique
-  $san = "2.5.29.17={text}DNS=localhost"
-  if ($domain -and $domain -ne "localhost") { $san += "&DNS=$domain" }
-  if ($lanIp) { $san += "&IP=$lanIp" }
-  $cert = New-SelfSignedCertificate -DnsName $certDns -TextExtension $san -CertStoreLocation "Cert:\LocalMachine\My" -NotAfter (Get-Date).AddYears(2)
+  $cert = $null
+  if ($lanIp) {
+    $san = "2.5.29.17={text}DNS=localhost"
+    if ($domain -and $domain -ne "localhost") { $san += "&DNS=$domain" }
+    $san += "&IPAddress=$lanIp"
+    try {
+      $cert = New-SelfSignedCertificate -DnsName $certDns -TextExtension $san -CertStoreLocation "Cert:\LocalMachine\My" -NotAfter (Get-Date).AddYears(2)
+    } catch {
+      Warn "Could not add IP SAN to certificate on this Windows build. Falling back to DNS-only cert."
+    }
+  }
+  if (-not $cert) {
+    $cert = New-SelfSignedCertificate -DnsName $certDns -CertStoreLocation "Cert:\LocalMachine\My" -NotAfter (Get-Date).AddYears(2)
+  }
   $thumb = $cert.Thumbprint
   Import-Certificate -FilePath (Export-Certificate -Cert "Cert:\LocalMachine\My\$thumb" -FilePath $certPath -Force).FullName -CertStoreLocation "Cert:\LocalMachine\Root" | Out-Null
 
