@@ -537,11 +537,6 @@ function Ensure-IISProxyMode([string]$domain,[string]$siteRoot,[string]$certPath
       </requestFiltering>
     </security>
     <rewrite>
-      <allowedServerVariables>
-        <add name="HTTP_X_FORWARDED_PROTO" />
-        <add name="HTTP_X_FORWARDED_HOST" />
-        <add name="HTTP_X_FORWARDED_FOR" />
-      </allowedServerVariables>
       <rules>
         <rule name="ReverseProxyInboundRule1" stopProcessing="true">
           <match url="(.*)" />
