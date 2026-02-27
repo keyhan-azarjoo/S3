@@ -20,6 +20,14 @@ function Info($m){ Write-Host "[INFO] $m" }
 function Warn($m){ Write-Host "[WARN] $m" -ForegroundColor Yellow }
 function Err ($m){ Write-Host "[ERROR] $m" -ForegroundColor Red }
 
+function Initialize-NetworkDefaults {
+  try {
+    $tls12 = [Net.SecurityProtocolType]::Tls12
+    $tls11 = [Net.SecurityProtocolType]::Tls11
+    [Net.ServicePointManager]::SecurityProtocol = $tls12 -bor $tls11
+  } catch {}
+}
+
 function Is-Admin {
   $p = New-Object Security.Principal.WindowsPrincipal([Security.Principal.WindowsIdentity]::GetCurrent())
   return $p.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
@@ -403,23 +411,40 @@ function Ensure-MinIONative([string]$root,[int]$apiPort,[int]$uiPort,[string]$pu
     "https://dl.min.io/server/minio/release/windows-amd64/archive/minio.RELEASE.2023-10-16T04-13-43Z",
     "https://dl.min.io/server/minio/release/windows-amd64/archive/minio.RELEASE.2025-04-22T22-12-26Z",
     "https://dl.min.io/server/minio/release/windows-amd64/archive/minio.RELEASE.2025-01-18T00-31-37Z",
-    "https://dl.min.io/server/minio/release/windows-amd64/minio.exe"
+    "https://dl.min.io/server/minio/release/windows-amd64/minio.exe",
+    "https://github.com/minio/minio/releases/latest/download/minio.exe"
   )
   $downloaded = $false
+  $lastDownloadError = ""
   foreach ($u in $minioUrls) {
+    $ok = $false
     try {
       Info "Downloading MinIO server binary: $u"
-      Invoke-WebRequest -Uri $u -OutFile $exe
-      if ((Test-Path $exe) -and ((Get-Item $exe).Length -gt 10000000)) {
+      if (Has-Cmd "curl.exe") {
+        & curl.exe -L --fail --retry 3 --retry-delay 2 --connect-timeout 20 -o $exe $u
+        if ($LASTEXITCODE -eq 0 -and (Test-Path $exe) -and ((Get-Item $exe).Length -gt 10000000)) {
+          $ok = $true
+        }
+      }
+      if (-not $ok) {
+        Invoke-WebRequest -Uri $u -OutFile $exe -UseBasicParsing
+        if ((Test-Path $exe) -and ((Get-Item $exe).Length -gt 10000000)) {
+          $ok = $true
+        }
+      }
+      if ($ok) {
         $downloaded = $true
         break
       }
     } catch {
-      Warn "MinIO download failed from: $u"
+      $lastDownloadError = $_.Exception.Message
+      Warn "MinIO download failed from: $u ($lastDownloadError)"
     }
   }
   if (-not $downloaded) {
     Err "Failed to download MinIO binary."
+    if ($lastDownloadError) { Warn "Last download error: $lastDownloadError" }
+    Warn "Check outbound HTTPS access to: dl.min.io and github.com, or place minio.exe manually at: $exe"
     exit 1
   }
   try {
@@ -1463,6 +1488,7 @@ server {
 # Main
 # ---------------------------
 Relaunch-Elevated
+Initialize-NetworkDefaults
 Info "===== Local S3 Storage Installer (Windows) ====="
 $mode = Ask-InstallMode
 if ($mode -eq "iis") {
