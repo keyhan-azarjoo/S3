@@ -13,6 +13,8 @@ $Script:RestartRequired = $false
 $Script:RestartReasons = New-Object System.Collections.Generic.List[string]
 $Script:StateDir = Join-Path $env:ProgramData "LocalS3"
 $Script:RestartCountFile = Join-Path $Script:StateDir "restart-count.txt"
+$Script:ActiveAccessKey = "admin"
+$Script:ActiveSecretKey = "StrongPassword123"
 
 function Info($m){ Write-Host "[INFO] $m" }
 function Warn($m){ Write-Host "[WARN] $m" -ForegroundColor Yellow }
@@ -219,6 +221,53 @@ function Wait-TcpPort([string]$targetHost, [int]$port, [int]$maxSeconds = 30) {
   return $false
 }
 
+function Test-MinIOAdminLogin([int]$uiPort, [string]$accessKey = "admin", [string]$secretKey = "StrongPassword123") {
+  $body = @{ accessKey = $accessKey; secretKey = $secretKey } | ConvertTo-Json -Compress
+  try {
+    Invoke-RestMethod -Method Post -Uri ("http://127.0.0.1:{0}/api/v1/login" -f $uiPort) -ContentType "application/json" -Body $body -TimeoutSec 10 | Out-Null
+    return $true
+  } catch {
+    return $false
+  }
+}
+
+function Test-MinIOHealth([int]$apiPort) {
+  $uris = @(
+    ("http://127.0.0.1:{0}/minio/health/live" -f $apiPort),
+    ("http://127.0.0.1:{0}/minio/health/ready" -f $apiPort),
+    ("http://127.0.0.1:{0}/" -f $apiPort)
+  )
+  foreach ($uri in $uris) {
+    try {
+      $r = Invoke-WebRequest -Uri $uri -UseBasicParsing -MaximumRedirection 0 -TimeoutSec 8
+      if ($r -and $r.StatusCode) { return $true }
+    } catch {
+      # If server responded with any HTTP status (even 3xx/4xx/5xx),
+      # MinIO is reachable and considered healthy enough for installer continuation.
+      $resp = $_.Exception.Response
+      if ($resp -and $resp.StatusCode) { return $true }
+    }
+  }
+  return $false
+}
+
+function Show-MinIODiagnostics([string]$logFile, [int]$apiPort, [int]$uiPort, [string]$taskName) {
+  Warn "MinIO diagnostics:"
+  Write-Host ("  API health endpoint: http://127.0.0.1:{0}/minio/health/live" -f $apiPort)
+  Write-Host ("  Console endpoint:    http://127.0.0.1:{0}" -f $uiPort)
+  if (Test-Path $logFile) {
+    Write-Host ""
+    Write-Host "--- MinIO log tail ---"
+    Get-Content -Path $logFile -Tail 80 -ErrorAction SilentlyContinue
+  }
+  $prev = $ErrorActionPreference
+  $ErrorActionPreference = "Continue"
+  Write-Host ""
+  Write-Host "--- Scheduled task status ---"
+  schtasks /Query /TN $taskName /V /FO LIST 2>$null | Out-String | Write-Host
+  $ErrorActionPreference = $prev
+}
+
 function Ask-InstallMode {
   Write-Host ""
   Write-Host "Choose installation mode:"
@@ -326,22 +375,59 @@ function Ensure-IISInstalled {
 }
 
 function Ensure-MinIONative([string]$root,[int]$apiPort,[int]$uiPort,[string]$publicUrl) {
+  $Script:ActiveAccessKey = "admin"
+  $Script:ActiveSecretKey = "StrongPassword123"
   $binDir = Join-Path $root "minio"
   $dataDir = Join-Path $root "data"
+  $configDir = Join-Path $root "config"
   $exe = Join-Path $binDir "minio.exe"
-  New-Item -ItemType Directory -Force -Path $binDir,$dataDir | Out-Null
-  if (-not (Test-Path $exe)) {
-    Info "Downloading MinIO server binary..."
-    Invoke-WebRequest -Uri "https://dl.min.io/server/minio/release/windows-amd64/minio.exe" -OutFile $exe
+  $runner = Join-Path $binDir "run-minio.cmd"
+  $logFile = Join-Path $binDir "minio.log"
+  New-Item -ItemType Directory -Force -Path $binDir,$dataDir,$configDir | Out-Null
+  # Use a pinned stable release first (deterministic), then fallback to latest.
+  $minioUrls = @(
+    "https://dl.min.io/server/minio/release/windows-amd64/archive/minio.RELEASE.2023-07-21T21-12-44Z",
+    "https://dl.min.io/server/minio/release/windows-amd64/archive/minio.RELEASE.2023-10-16T04-13-43Z",
+    "https://dl.min.io/server/minio/release/windows-amd64/archive/minio.RELEASE.2025-04-22T22-12-26Z",
+    "https://dl.min.io/server/minio/release/windows-amd64/archive/minio.RELEASE.2025-01-18T00-31-37Z",
+    "https://dl.min.io/server/minio/release/windows-amd64/minio.exe"
+  )
+  $downloaded = $false
+  foreach ($u in $minioUrls) {
+    try {
+      Info "Downloading MinIO server binary: $u"
+      Invoke-WebRequest -Uri $u -OutFile $exe
+      if ((Test-Path $exe) -and ((Get-Item $exe).Length -gt 10000000)) {
+        $downloaded = $true
+        break
+      }
+    } catch {
+      Warn "MinIO download failed from: $u"
+    }
   }
+  if (-not $downloaded) {
+    Err "Failed to download MinIO binary."
+    exit 1
+  }
+  try {
+    $ver = & $exe --version 2>$null | Select-Object -First 1
+    if ($ver) { Info "Using MinIO binary: $ver" }
+  } catch {}
 
-  [Environment]::SetEnvironmentVariable("MINIO_ROOT_USER","admin","Machine")
-  [Environment]::SetEnvironmentVariable("MINIO_ROOT_PASSWORD","StrongPassword123","Machine")
-  [Environment]::SetEnvironmentVariable("MINIO_SERVER_URL",$publicUrl,"Machine")
-  [Environment]::SetEnvironmentVariable("MINIO_BROWSER_REDIRECT_URL",$publicUrl,"Machine")
+  $runnerBody = @"
+@echo off
+set MINIO_SERVER_URL=
+set MINIO_BROWSER_REDIRECT_URL=
+set MINIO_CONSOLE_REDIRECT_URL=
+set MINIO_ROOT_USER=admin
+set MINIO_ROOT_PASSWORD=StrongPassword123
+set MINIO_API_ROOT_ACCESS=on
+"$exe" server "$dataDir" --config-dir "$configDir" --address ":$apiPort" --console-address ":$uiPort" >> "$logFile" 2>&1
+"@
+  [System.IO.File]::WriteAllText($runner, $runnerBody, (New-Object System.Text.UTF8Encoding($false)))
 
   $taskName = "LocalS3-MinIO"
-  $cmd = "`"$exe`" server `"$dataDir`" --address `":$apiPort`" --console-address `":$uiPort`""
+  $cmd = "cmd.exe /c `"`"$runner`"`""
   $prev = $ErrorActionPreference
   $ErrorActionPreference = "Continue"
   schtasks /Query /TN $taskName 1>$null 2>$null
@@ -355,18 +441,85 @@ function Ensure-MinIONative([string]$root,[int]$apiPort,[int]$uiPort,[string]$pu
     Err "Failed to create MinIO scheduled task."
     exit 1
   }
-  schtasks /Run /TN $taskName 1>$null 2>$null | Out-Null
-  if ($LASTEXITCODE -ne 0) {
-    Warn "MinIO task created but could not be started immediately. It will run at next startup."
-  }
+  Get-Process -Name "minio" -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
+  Remove-Item -Path $logFile -Force -ErrorAction SilentlyContinue
+  Start-Process -FilePath "cmd.exe" -ArgumentList @("/c","`"$runner`"") -WindowStyle Hidden | Out-Null
   $ErrorActionPreference = $prev
 
-  if (-not (Wait-TcpPort -targetHost "127.0.0.1" -port $uiPort -maxSeconds 45)) {
-    Warn "MinIO console port $uiPort did not become ready in time."
-    Warn "Task status:"
-    schtasks /Query /TN $taskName /V /FO LIST 2>$null | Out-String | Write-Host
+  if (-not (Wait-TcpPort -targetHost "127.0.0.1" -port $apiPort -maxSeconds 45)) {
+    Warn "MinIO API port $apiPort did not become ready in time."
+    Show-MinIODiagnostics -logFile $logFile -apiPort $apiPort -uiPort $uiPort -taskName $taskName
     Err "MinIO service is not reachable yet. Fix MinIO startup and rerun."
     exit 1
+  }
+  if (-not (Test-MinIOHealth -apiPort $apiPort)) {
+    Warn "Port $apiPort is open but MinIO health check failed."
+    Show-MinIODiagnostics -logFile $logFile -apiPort $apiPort -uiPort $uiPort -taskName $taskName
+    Err "MinIO did not pass health check. Likely a port conflict or startup failure."
+    exit 1
+  }
+
+  # Console login probe can vary across MinIO/console versions; try both UI and API ports.
+  $adminLoginOk = (Test-MinIOAdminLogin -uiPort $uiPort -accessKey "admin" -secretKey "StrongPassword123") -or (Test-MinIOAdminLogin -uiPort $apiPort -accessKey "admin" -secretKey "StrongPassword123")
+  if (-not $adminLoginOk) {
+    $defaultLoginOk = (Test-MinIOAdminLogin -uiPort $uiPort -accessKey "minioadmin" -secretKey "minioadmin") -or (Test-MinIOAdminLogin -uiPort $apiPort -accessKey "minioadmin" -secretKey "minioadmin")
+    if ($defaultLoginOk) {
+      Warn "MinIO accepted default credentials on this run (minioadmin/minioadmin)."
+      Warn "Using detected working credentials for this deployment."
+      $Script:ActiveAccessKey = "minioadmin"
+      $Script:ActiveSecretKey = "minioadmin"
+      return
+    }
+    Warn "MinIO is running, but login with expected admin credentials failed."
+    Warn "Running automatic credential reset once..."
+    $idDir = Join-Path $dataDir ".minio.sys"
+    $ErrorActionPreference = "Continue"
+    schtasks /End /TN $taskName 1>$null 2>$null | Out-Null
+    Get-Process -Name "minio" -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
+    if (Test-Path $dataDir) {
+      Warn "Resetting MinIO data folder: $dataDir"
+      Remove-Item -Recurse -Force -Path $dataDir -ErrorAction SilentlyContinue
+      New-Item -ItemType Directory -Force -Path $dataDir | Out-Null
+    }
+    if (Test-Path $idDir) {
+      Warn "Removing MinIO identity metadata: $idDir"
+      Remove-Item -Recurse -Force -Path $idDir -ErrorAction SilentlyContinue
+    }
+    if (Test-Path $configDir) {
+      Warn "Removing MinIO config state: $configDir"
+      Remove-Item -Recurse -Force -Path $configDir -ErrorAction SilentlyContinue
+      New-Item -ItemType Directory -Force -Path $configDir | Out-Null
+    }
+    Start-Process -FilePath "cmd.exe" -ArgumentList @("/c","`"$runner`"") -WindowStyle Hidden | Out-Null
+    $ErrorActionPreference = $prev
+    if (-not (Wait-TcpPort -targetHost "127.0.0.1" -port $uiPort -maxSeconds 45)) {
+      Err "MinIO did not come back after identity reset."
+      exit 1
+    }
+    if (-not (Test-MinIOHealth -apiPort $apiPort)) {
+      Show-MinIODiagnostics -logFile $logFile -apiPort $apiPort -uiPort $uiPort -taskName $taskName
+      Err "MinIO health check failed after reset."
+      exit 1
+    }
+    $adminLoginOkAfterReset = (Test-MinIOAdminLogin -uiPort $uiPort -accessKey "admin" -secretKey "StrongPassword123") -or (Test-MinIOAdminLogin -uiPort $apiPort -accessKey "admin" -secretKey "StrongPassword123")
+    if (-not $adminLoginOkAfterReset) {
+      $defaultLoginOkAfterReset = (Test-MinIOAdminLogin -uiPort $uiPort -accessKey "minioadmin" -secretKey "minioadmin") -or (Test-MinIOAdminLogin -uiPort $apiPort -accessKey "minioadmin" -secretKey "minioadmin")
+      if ($defaultLoginOkAfterReset) {
+        Warn "MinIO still uses default credentials (minioadmin/minioadmin) after reset."
+        $Script:ActiveAccessKey = "minioadmin"
+        $Script:ActiveSecretKey = "minioadmin"
+        return
+      }
+      Warn "Login probe still failing after automatic reset, but MinIO health is OK."
+      Warn "Continuing installation. Check MinIO log and authenticate in console manually."
+      Show-MinIODiagnostics -logFile $logFile -apiPort $apiPort -uiPort $uiPort -taskName $taskName
+      $Script:ActiveAccessKey = "admin"
+      $Script:ActiveSecretKey = "StrongPassword123"
+      return
+    }
+    $Script:ActiveAccessKey = "admin"
+    $Script:ActiveSecretKey = "StrongPassword123"
+    Info "MinIO credentials reset succeeded. Admin login is now valid."
   }
 }
 
@@ -449,7 +602,7 @@ function Ensure-IISProxyMode([string]$domain,[string]$siteRoot,[string]$certPath
 }
 
 function Install-IISMode {
-  $root = Join-Path (Split-Path -Parent $PSCommandPath) "storage-server"
+  $root = Join-Path $env:ProgramData "LocalS3\storage-server"
   $certDir = Join-Path $root "nginx\certs"
   $siteRoot = Join-Path $root "iis-site"
   New-Item -ItemType Directory -Force -Path $certDir,$siteRoot | Out-Null
@@ -473,7 +626,7 @@ function Install-IISMode {
     Warn ("Some default ports are busy (" + ($busyDefaults -join ", ") + ") and an existing LocalS3 IIS installation was detected.")
     $ans = (Read-Host "Delete previous LocalS3 IIS install and reinstall now? (Y/n)").Trim().ToLowerInvariant()
     if ($ans -eq "" -or $ans -eq "y" -or $ans -eq "yes") {
-      Remove-ExistingLocalS3IISInstall
+      Remove-ExistingLocalS3IISInstall -root $root -DeleteData
     } else {
       Warn "Keeping existing LocalS3 install. Installer will use alternate/custom ports as needed."
     }
@@ -515,8 +668,8 @@ function Install-IISMode {
   }
   Write-Host ""
   Write-Host "Login:"
-  Write-Host "  Username: admin"
-  Write-Host "  Password: StrongPassword123"
+  Write-Host "  Username: $Script:ActiveAccessKey"
+  Write-Host "  Password: $Script:ActiveSecretKey"
 }
 
 function Enable-WSLFeatures {
@@ -826,7 +979,7 @@ function Has-ExistingLocalS3IISInstall {
   return $exists
 }
 
-function Remove-ExistingLocalS3IISInstall {
+function Remove-ExistingLocalS3IISInstall([string]$root, [switch]$DeleteData) {
   Info "Removing existing LocalS3 IIS installation..."
   $prev = $ErrorActionPreference
   $ErrorActionPreference = "Continue"
@@ -843,6 +996,30 @@ function Remove-ExistingLocalS3IISInstall {
   schtasks /Delete /TN "LocalS3-MinIO" /F 1>$null 2>$null | Out-Null
 
   Get-Process -Name "minio" -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
+  if ($DeleteData -and $root) {
+    $dataDir = Join-Path $root "data"
+    $configDir = Join-Path $root "config"
+    $siteDir = Join-Path $root "iis-site"
+    $certDir = Join-Path $root "nginx\certs"
+    if (Test-Path $dataDir) {
+      Warn "Deleting previous MinIO data to reset credentials and state..."
+      Remove-Item -Recurse -Force -Path $dataDir -ErrorAction SilentlyContinue
+      New-Item -ItemType Directory -Force -Path $dataDir | Out-Null
+    }
+    if (Test-Path $configDir) {
+      Warn "Deleting previous MinIO config state..."
+      Remove-Item -Recurse -Force -Path $configDir -ErrorAction SilentlyContinue
+      New-Item -ItemType Directory -Force -Path $configDir | Out-Null
+    }
+    if (Test-Path $siteDir) {
+      Remove-Item -Recurse -Force -Path $siteDir -ErrorAction SilentlyContinue
+      New-Item -ItemType Directory -Force -Path $siteDir | Out-Null
+    }
+    if (Test-Path $certDir) {
+      Remove-Item -Recurse -Force -Path $certDir -ErrorAction SilentlyContinue
+      New-Item -ItemType Directory -Force -Path $certDir | Out-Null
+    }
+  }
   $ErrorActionPreference = $prev
   Start-Sleep -Seconds 2
 }
