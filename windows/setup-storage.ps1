@@ -251,6 +251,19 @@ function Test-MinIOHealth([int]$apiPort) {
   return $false
 }
 
+function Test-HttpReachable([string]$uri) {
+  try {
+    $r = Invoke-WebRequest -Uri $uri -UseBasicParsing -MaximumRedirection 0 -TimeoutSec 8
+    if ($r -and $r.StatusCode) { return $true }
+  } catch {
+    # Any HTTP response (including 3xx/4xx/5xx) means endpoint is reachable.
+    $resp = $_.Exception.Response
+    if ($resp -and $resp.StatusCode) { return $true }
+    return $false
+  }
+  return $false
+}
+
 function Show-MinIODiagnostics([string]$logFile, [int]$apiPort, [int]$uiPort, [string]$taskName) {
   Warn "MinIO diagnostics:"
   Write-Host ("  API health endpoint: http://127.0.0.1:{0}/minio/health/live" -f $apiPort)
@@ -525,6 +538,7 @@ set MINIO_API_ROOT_ACCESS=on
 
 function Ensure-IISProxyMode([string]$domain,[string]$siteRoot,[string]$certPath,[string]$keyPath,[int]$httpsPort,[int]$targetPort,[string]$lanIp) {
   Import-Module WebAdministration
+  $Script:IISCertIncludesIpSan = $false
   New-Item -ItemType Directory -Force -Path $siteRoot | Out-Null
   $webConfig = @"
 <?xml version="1.0" encoding="utf-8"?>
@@ -594,6 +608,7 @@ function Ensure-IISProxyMode([string]$domain,[string]$siteRoot,[string]$certPath
     $san += "&IPAddress=$lanIp"
     try {
       $cert = New-SelfSignedCertificate -DnsName $certDns -TextExtension $san -CertStoreLocation "Cert:\LocalMachine\My" -NotAfter (Get-Date).AddYears(2)
+      if ($cert) { $Script:IISCertIncludesIpSan = $true }
     } catch {
       Warn "Could not add IP SAN to certificate on this Windows build. Falling back to DNS-only cert."
     }
@@ -637,6 +652,12 @@ function Ensure-IISProxyMode([string]$domain,[string]$siteRoot,[string]$certPath
 
   if ($domain -ne "localhost") { Ensure-HostsEntry -domain $domain }
   if ($lanIp) { Ensure-FirewallPort -port $httpsPort }
+
+  $proxyUri = if ($httpsPort -eq 443) { "https://$domain/" } else { "https://${domain}:$httpsPort/" }
+  if (-not (Test-HttpReachable -uri $proxyUri)) {
+    Warn "IIS HTTPS endpoint probe failed: $proxyUri"
+    Warn "Check IIS logs/Event Viewer and confirm URL Rewrite + ARR are installed and enabled."
+  }
 }
 
 function Install-IISMode {
@@ -703,6 +724,10 @@ function Install-IISMode {
       Write-Host "LAN URL:                https://${lanIp}:$httpsPort"
     }
     Write-Host "For DNS: map $domain -> $lanIp"
+    if (-not $Script:IISCertIncludesIpSan) {
+      Warn "TLS cert does not include LAN IP SAN on this Windows build."
+      Warn "Use the domain URL for HTTPS. LAN-IP URL may show certificate name mismatch."
+    }
   }
   Write-Host ""
   Write-Host "Login:"
