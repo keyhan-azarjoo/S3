@@ -537,6 +537,11 @@ function Ensure-IISProxyMode([string]$domain,[string]$siteRoot,[string]$certPath
       </requestFiltering>
     </security>
     <rewrite>
+      <allowedServerVariables>
+        <add name="HTTP_X_FORWARDED_PROTO" />
+        <add name="HTTP_X_FORWARDED_HOST" />
+        <add name="HTTP_X_FORWARDED_FOR" />
+      </allowedServerVariables>
       <rules>
         <rule name="ReverseProxyInboundRule1" stopProcessing="true">
           <match url="(.*)" />
@@ -569,6 +574,21 @@ function Ensure-IISProxyMode([string]$domain,[string]$siteRoot,[string]$certPath
     Write-Host "  - URL Rewrite"
     Write-Host "  - Application Request Routing (ARR)"
     exit 1
+  }
+
+  try {
+    $allowedVars = Get-WebConfigurationProperty -PSPath 'MACHINE/WEBROOT/APPHOST' -Filter "system.webServer/rewrite/allowedServerVariables" -Name "." -ErrorAction Stop
+    foreach ($varName in @("HTTP_X_FORWARDED_PROTO","HTTP_X_FORWARDED_HOST","HTTP_X_FORWARDED_FOR")) {
+      $alreadyAllowed = $false
+      if ($allowedVars -and $allowedVars.Collection) {
+        $alreadyAllowed = $null -ne ($allowedVars.Collection | Where-Object { $_.Attributes["name"].Value -eq $varName } | Select-Object -First 1)
+      }
+      if (-not $alreadyAllowed) {
+        Add-WebConfigurationProperty -PSPath 'MACHINE/WEBROOT/APPHOST' -Filter "system.webServer/rewrite/allowedServerVariables" -Name "." -Value @{ name = $varName } -ErrorAction Stop | Out-Null
+      }
+    }
+  } catch {
+    Warn "Could not update IIS Rewrite allowed server variables automatically. If proxy requests fail, allow HTTP_X_FORWARDED_PROTO/HOST/FOR in IIS Rewrite settings."
   }
 
   $certDns = @("localhost",$domain) | Select-Object -Unique
