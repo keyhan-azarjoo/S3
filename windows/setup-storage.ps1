@@ -1403,6 +1403,7 @@ function Prompt-CleanupPreviousServers([string]$dockerCtx) {
       docker --context $dockerCtx rm -f $c.Name 2>$null | Out-Null
     }
     docker --context $dockerCtx network rm storage-net 2>$null | Out-Null
+    docker --context $dockerCtx volume rm -f locals3-minio-data 2>$null | Out-Null
     $ErrorActionPreference = $prev
     Info "Previous containers were removed."
   } else {
@@ -1623,13 +1624,14 @@ function Trust-LocalTlsCert([string]$certPath) {
   }
 }
 
-function Start-ContainersFallback([string]$dockerCtx, [string]$ngconf, [string]$ngcerts, [string]$data, [int]$nginxHttpsPort, [int]$minioApi, [int]$minioUI) {
+function Start-ContainersFallback([string]$dockerCtx, [string]$ngconf, [string]$ngcerts, [string]$minioVolume, [int]$nginxHttpsPort, [int]$minioApi, [int]$minioUI) {
   Warn "Falling back to direct 'docker run' startup (compose unavailable in this environment)."
   $network = "storage-net"
 
   $prev = $ErrorActionPreference
   $ErrorActionPreference = "Continue"
   docker --context $dockerCtx network create $network 2>$null | Out-Null
+  docker --context $dockerCtx volume create $minioVolume 2>$null | Out-Null
   docker --context $dockerCtx rm -f minio nginx 2>$null | Out-Null
 
   docker --context $dockerCtx run -d `
@@ -1641,7 +1643,7 @@ function Start-ContainersFallback([string]$dockerCtx, [string]$ngconf, [string]$
     -e MINIO_ROOT_PASSWORD=StrongPassword123 `
     -p "${minioApi}:9000" `
     -p "${minioUI}:9001" `
-    -v "${data}:/data" `
+    -v "${minioVolume}:/data" `
     minio/minio server /data --console-address ":9001" | Out-Null
   $minioExit = $LASTEXITCODE
   if ($minioExit -ne 0) {
@@ -1672,6 +1674,7 @@ function Write-FilesAndUp {
   $ngconf = Join-Path $project "nginx\conf"
   $ngcerts = Join-Path $project "nginx\certs"
   $data   = Join-Path $project "data"
+  $minioVolume = "locals3-minio-data"
 
   $domainInput = Read-Host "Enter local domain/URL for HTTPS (default: localhost)"
   $domain = Normalize-HostInput $domainInput
@@ -1752,7 +1755,7 @@ services:
       MINIO_PROMETHEUS_AUTH_TYPE: public
       MINIO_BROWSER_REDIRECT_URL: ""
     volumes:
-      - ./data:/data
+      - ${minioVolume}:/data
     ports:
       - "$minioApi:9000"
       - "$minioUI:9001"
@@ -1783,6 +1786,9 @@ services:
       minio:
         condition: service_healthy
     restart: unless-stopped
+
+volumes:
+  ${minioVolume}:
 "@
 
   $serverNames = if ($domain -eq "localhost") { "localhost" } else { "$domain localhost" }
@@ -1880,7 +1886,7 @@ server {
     if ($composeText -match "invalid proto:") {
       Warn "Detected compose transport error ('invalid proto:')."
       Pop-Location
-      Start-ContainersFallback -dockerCtx $dockerCtx -ngconf $ngconf -ngcerts $ngcerts -data $data -nginxHttpsPort $nginxHttps -minioApi $minioApi -minioUI $minioUI
+      Start-ContainersFallback -dockerCtx $dockerCtx -ngconf $ngconf -ngcerts $ngcerts -minioVolume $minioVolume -nginxHttpsPort $nginxHttps -minioApi $minioApi -minioUI $minioUI
       $usedFallback = $true
     } else {
       Warn "Showing compose logs..."
