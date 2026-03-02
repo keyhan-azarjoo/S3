@@ -1053,11 +1053,13 @@ function Install-IISMode {
   Run-PreflightChecks -DataPath $root
 
   $publicUrl = if ($httpsPort -eq 443) { "https://$domain" } else { "https://${domain}:$httpsPort" }
-  # Keep the console on the chosen host name for a cleaner, consistent login URL.
+  # If the selected host is localhost but LAN access is enabled, do not force a browser
+  # redirect target. That allows users opening the console by LAN IP to stay on that IP.
   $consoleBrowserUrl = if ($consoleHttpsPort -eq 443) { "https://$domain" } else { "https://${domain}:$consoleHttpsPort" }
+  $consoleRedirectUrl = if ($domain -eq "localhost" -and $lanIp) { "" } else { $consoleBrowserUrl }
 
   Ensure-IISInstalled
-  Ensure-MinIONative -root $root -apiPort $apiPort -uiPort $uiPort -publicUrl $publicUrl -consoleBrowserUrl $consoleBrowserUrl
+  Ensure-MinIONative -root $root -apiPort $apiPort -uiPort $uiPort -publicUrl $publicUrl -consoleBrowserUrl $consoleRedirectUrl
   $crt = Join-Path $certDir "localhost.crt"
   $key = Join-Path $certDir "localhost.key"
   Ensure-IISProxyMode -domain $domain -siteRoot $siteRoot -certPath $crt -keyPath $key -httpsPort $httpsPort -targetPort $apiPort -consoleHttpsPort $consoleHttpsPort -uiPort $uiPort -lanIp $lanIp
@@ -1741,6 +1743,7 @@ function Write-FilesAndUp {
 
   $consoleProxyUrl = if ($nginxHttps -eq 443) { "https://$domain" } else { "https://${domain}:$nginxHttps" }
   $apiProxyUrl = if ($apiHttps -eq 443) { "https://$domain" } else { "https://${domain}:$apiHttps" }
+  $consoleRedirectUrl = if ($domain -eq "localhost" -and $lanIp) { "" } else { $consoleProxyUrl }
 
   Info "Using ports:"
   Info " - Console HTTPS: $nginxHttps"
@@ -1768,7 +1771,7 @@ services:
       MINIO_ROOT_USER: admin
       MINIO_ROOT_PASSWORD: StrongPassword123
       MINIO_PROMETHEUS_AUTH_TYPE: public
-      MINIO_BROWSER_REDIRECT_URL: "$consoleProxyUrl"
+      MINIO_BROWSER_REDIRECT_URL: "$consoleRedirectUrl"
     volumes:
       - ${minioVolume}:/data
     ports:
@@ -1926,7 +1929,7 @@ server {
     if ($composeText -match "invalid proto:") {
       Warn "Detected compose transport error ('invalid proto:')."
       Pop-Location
-      Start-ContainersFallback -dockerCtx $dockerCtx -ngconf $ngconf -ngcerts $ngcerts -minioVolume $minioVolume -minioImage $minioImage -consoleHttpsPort $nginxHttps -apiHttpsPort $apiHttps -minioApi $minioApi -minioUI $minioUI -consoleProxyUrl $consoleProxyUrl
+      Start-ContainersFallback -dockerCtx $dockerCtx -ngconf $ngconf -ngcerts $ngcerts -minioVolume $minioVolume -minioImage $minioImage -consoleHttpsPort $nginxHttps -apiHttpsPort $apiHttps -minioApi $minioApi -minioUI $minioUI -consoleProxyUrl $consoleRedirectUrl
       $usedFallback = $true
     } else {
       Warn "Showing compose logs..."
