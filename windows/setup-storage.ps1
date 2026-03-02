@@ -1668,8 +1668,7 @@ function Start-ContainersFallback([string]$dockerCtx, [string]$ngconf, [string]$
 }
 
 function Write-FilesAndUp {
-  $root = Split-Path -Parent $PSCommandPath
-  $project = Join-Path $root "storage-server"
+  $project = Join-Path $env:ProgramData "LocalS3\storage-server"
   $ngconf = Join-Path $project "nginx\conf"
   $ngcerts = Join-Path $project "nginx\certs"
   $data   = Join-Path $project "data"
