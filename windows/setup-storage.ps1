@@ -1800,7 +1800,8 @@ gzip_min_length 1024;
 gzip_vary on;
 
 server {
-    listen 443 ssl http2;
+    listen 443 ssl;
+    http2 on;
     server_name $serverNames;
 
     ssl_certificate     /etc/nginx/certs/localhost.crt;
