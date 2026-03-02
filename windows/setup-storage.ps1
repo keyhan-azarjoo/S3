@@ -284,6 +284,18 @@ function Normalize-HostInput([string]$raw) {
   return $value
 }
 
+function Resolve-BrowserSessionDuration {
+  $defaultValue = "3650d"
+  while ($true) {
+    $raw = (Read-Host "Enter web session/share-link max duration (examples: 12h, 2d, 3650d) (default: $defaultValue)").Trim()
+    if ([string]::IsNullOrWhiteSpace($raw)) { return $defaultValue }
+    $value = $raw.ToLowerInvariant()
+    if ($value -match '^[1-9][0-9]*(s|m|h|d)$') { return $value }
+    Warn "Invalid duration: $raw"
+    Warn "Use a positive number followed by one unit: s, m, h, or d."
+  }
+}
+
 function Test-TcpPort([string]$targetHost, [int]$port, [int]$timeoutMs = 1500) {
   $client = New-Object System.Net.Sockets.TcpClient
   try {
@@ -564,7 +576,7 @@ function Ensure-IISInstalled {
   Info "IIS prerequisites installed successfully."
 }
 
-function Ensure-MinIONative([string]$root,[int]$apiPort,[int]$uiPort,[string]$publicUrl,[string]$consoleBrowserUrl="") {
+function Ensure-MinIONative([string]$root,[int]$apiPort,[int]$uiPort,[string]$publicUrl,[string]$consoleBrowserUrl="",[string]$browserSessionDuration="3650d") {
   $Script:ActiveAccessKey = "admin"
   $Script:ActiveSecretKey = "StrongPassword123"
   $preferredMinIORelease = "RELEASE.2025-04-22T22-12-26Z"
@@ -669,6 +681,7 @@ function Ensure-MinIONative([string]$root,[int]$apiPort,[int]$uiPort,[string]$pu
 @echo off
 set MINIO_SERVER_URL=
 set MINIO_BROWSER_REDIRECT_URL=$consoleBrowserUrl
+set MINIO_BROWSER_SESSION_DURATION=$browserSessionDuration
 set MINIO_CONSOLE_REDIRECT_URL=
 set MINIO_ROOT_USER=admin
 set MINIO_ROOT_PASSWORD=StrongPassword123
@@ -1014,6 +1027,8 @@ function Install-IISMode {
   $domainInput = Read-Host "Enter local domain/URL for HTTPS (default: localhost)"
   $domain = Normalize-HostInput $domainInput
   Info "Using local domain: $domain"
+  $browserSessionDuration = Resolve-BrowserSessionDuration
+  Info "Web session/share-link max duration: $browserSessionDuration"
   $enableLan = $true
   Info "LAN access: enabled"
   $lanIp = $null
@@ -1059,7 +1074,7 @@ function Install-IISMode {
   $consoleRedirectUrl = if ($domain -eq "localhost" -and $lanIp) { "" } else { $consoleBrowserUrl }
 
   Ensure-IISInstalled
-  Ensure-MinIONative -root $root -apiPort $apiPort -uiPort $uiPort -publicUrl $publicUrl -consoleBrowserUrl $consoleRedirectUrl
+  Ensure-MinIONative -root $root -apiPort $apiPort -uiPort $uiPort -publicUrl $publicUrl -consoleBrowserUrl $consoleRedirectUrl -browserSessionDuration $browserSessionDuration
   $crt = Join-Path $certDir "localhost.crt"
   $key = Join-Path $certDir "localhost.key"
   Ensure-IISProxyMode -domain $domain -siteRoot $siteRoot -certPath $crt -keyPath $key -httpsPort $httpsPort -targetPort $apiPort -consoleHttpsPort $consoleHttpsPort -uiPort $uiPort -lanIp $lanIp
@@ -1628,7 +1643,7 @@ function Trust-LocalTlsCert([string]$certPath) {
   }
 }
 
-function Start-ContainersFallback([string]$dockerCtx, [string]$ngconf, [string]$ngcerts, [string]$minioVolume, [string]$minioImage, [int]$consoleHttpsPort, [int]$apiHttpsPort, [int]$minioApi, [int]$minioUI, [string]$consoleProxyUrl) {
+function Start-ContainersFallback([string]$dockerCtx, [string]$ngconf, [string]$ngcerts, [string]$minioVolume, [string]$minioImage, [int]$consoleHttpsPort, [int]$apiHttpsPort, [int]$minioApi, [int]$minioUI, [string]$consoleProxyUrl, [string]$browserSessionDuration) {
   Warn "Falling back to direct 'docker run' startup (compose unavailable in this environment)."
   $network = "storage-net"
 
@@ -1646,6 +1661,7 @@ function Start-ContainersFallback([string]$dockerCtx, [string]$ngconf, [string]$
     -e MINIO_ROOT_USER=admin `
     -e MINIO_ROOT_PASSWORD=StrongPassword123 `
     -e MINIO_BROWSER_REDIRECT_URL="${consoleProxyUrl}" `
+    -e MINIO_BROWSER_SESSION_DURATION="${browserSessionDuration}" `
     -p "${minioApi}:9000" `
     -p "${minioUI}:9001" `
     -v "${minioVolume}:/data" `
@@ -1686,6 +1702,8 @@ function Write-FilesAndUp {
   $domainInput = Read-Host "Enter local domain/URL for HTTPS (default: localhost)"
   $domain = Normalize-HostInput $domainInput
   Info "Using local domain: $domain"
+  $browserSessionDuration = Resolve-BrowserSessionDuration
+  Info "Web session/share-link max duration: $browserSessionDuration"
   $enableLan = $true
   Info "LAN access: enabled"
   $lanIp = $null
@@ -1772,6 +1790,7 @@ services:
       MINIO_ROOT_PASSWORD: StrongPassword123
       MINIO_PROMETHEUS_AUTH_TYPE: public
       MINIO_BROWSER_REDIRECT_URL: "$consoleRedirectUrl"
+      MINIO_BROWSER_SESSION_DURATION: "$browserSessionDuration"
     volumes:
       - ${minioVolume}:/data
     ports:
@@ -1929,7 +1948,7 @@ server {
     if ($composeText -match "invalid proto:") {
       Warn "Detected compose transport error ('invalid proto:')."
       Pop-Location
-      Start-ContainersFallback -dockerCtx $dockerCtx -ngconf $ngconf -ngcerts $ngcerts -minioVolume $minioVolume -minioImage $minioImage -consoleHttpsPort $nginxHttps -apiHttpsPort $apiHttps -minioApi $minioApi -minioUI $minioUI -consoleProxyUrl $consoleRedirectUrl
+      Start-ContainersFallback -dockerCtx $dockerCtx -ngconf $ngconf -ngcerts $ngcerts -minioVolume $minioVolume -minioImage $minioImage -consoleHttpsPort $nginxHttps -apiHttpsPort $apiHttps -minioApi $minioApi -minioUI $minioUI -consoleProxyUrl $consoleRedirectUrl -browserSessionDuration $browserSessionDuration
       $usedFallback = $true
     } else {
       Warn "Showing compose logs..."
