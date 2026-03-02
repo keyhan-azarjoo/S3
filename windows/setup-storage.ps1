@@ -767,10 +767,11 @@ set MINIO_API_ROOT_ACCESS=on
   }
 }
 
-function Ensure-IISProxyMode([string]$domain,[string]$siteRoot,[string]$certPath,[string]$keyPath,[int]$httpsPort,[int]$targetPort,[string]$lanIp) {
+function Ensure-IISProxyMode([string]$domain,[string]$siteRoot,[string]$certPath,[string]$keyPath,[int]$httpsPort,[int]$targetPort,[int]$consoleHttpsPort,[int]$uiPort,[string]$lanIp) {
   Import-Module WebAdministration
   $Script:IISCertIncludesIpSan = $false
   $Script:IISCertThumb = ""
+  $siteName = "LocalS3"
   New-Item -ItemType Directory -Force -Path $siteRoot | Out-Null
   $webConfig = @"
 <?xml version="1.0" encoding="utf-8"?>
@@ -783,7 +784,19 @@ function Ensure-IISProxyMode([string]$domain,[string]$siteRoot,[string]$certPath
     </security>
     <rewrite>
       <rules>
-        <rule name="ReverseProxyInboundRule1" stopProcessing="true">
+        <rule name="MinIOConsoleProxy" stopProcessing="true">
+          <match url="(.*)" />
+          <conditions>
+            <add input="{SERVER_PORT}" pattern="^$consoleHttpsPort$" />
+          </conditions>
+          <serverVariables>
+            <set name="HTTP_X_FORWARDED_PROTO" value="https" />
+            <set name="HTTP_X_FORWARDED_HOST" value="{HTTP_HOST}" />
+            <set name="HTTP_X_FORWARDED_FOR" value="{REMOTE_ADDR}" />
+          </serverVariables>
+          <action type="Rewrite" url="http://127.0.0.1:$uiPort/{R:1}" />
+        </rule>
+        <rule name="MinIOApiProxy" stopProcessing="true">
           <match url="(.*)" />
           <serverVariables>
             <set name="HTTP_X_FORWARDED_PROTO" value="https" />
@@ -846,6 +859,14 @@ function Ensure-IISProxyMode([string]$domain,[string]$siteRoot,[string]$certPath
   netsh http delete sslcert ipport="0.0.0.0:$httpsPort"          2>$null | Out-Null
   netsh http delete sslcert ipport="127.0.0.1:$httpsPort"        2>$null | Out-Null
   if ($lanIp) { netsh http delete sslcert ipport="${lanIp}:${httpsPort}" 2>$null | Out-Null }
+  netsh http delete sslcert hostnameport="localhost:$consoleHttpsPort"   2>$null | Out-Null
+  netsh http delete sslcert hostnameport="127.0.0.1:$consoleHttpsPort"  2>$null | Out-Null
+  if ($domain -and $domain -ne "localhost") {
+    netsh http delete sslcert hostnameport="${domain}:$consoleHttpsPort" 2>$null | Out-Null
+  }
+  netsh http delete sslcert ipport="0.0.0.0:$consoleHttpsPort"          2>$null | Out-Null
+  netsh http delete sslcert ipport="127.0.0.1:$consoleHttpsPort"        2>$null | Out-Null
+  if ($lanIp) { netsh http delete sslcert ipport="${lanIp}:${consoleHttpsPort}" 2>$null | Out-Null }
 
   # Build SAN: always include localhost + 127.0.0.1, plus domain and LAN IP if present
   $sanExt = "2.5.29.17={text}DNS=localhost&IPAddress=127.0.0.1"
@@ -892,106 +913,81 @@ function Ensure-IISProxyMode([string]$domain,[string]$siteRoot,[string]$certPath
   $Script:IISCertThumb = $thumb
   Import-Certificate -FilePath (Export-Certificate -Cert "Cert:\LocalMachine\My\$thumb" -FilePath $certPath -Force).FullName -CertStoreLocation "Cert:\LocalMachine\Root" | Out-Null
 
-  if (Test-Path "IIS:\Sites\LocalS3-IIS") {
-    Remove-Website -Name "LocalS3-IIS"
+  foreach ($legacySite in @("LocalS3", "LocalS3-IIS", "LocalS3-Console")) {
+    if (Test-Path "IIS:\Sites\$legacySite") {
+      Remove-Website -Name $legacySite
+    }
   }
-  New-Website -Name "LocalS3-IIS" -PhysicalPath $siteRoot -Port 80 -Force | Out-Null
+  New-Website -Name $siteName -PhysicalPath $siteRoot -Port 80 -Force | Out-Null
   # Stop and remove all bindings (including the default HTTP port-80) before adding only HTTPS.
   # Leaving the port-80 binding causes a conflict with Default Web Site, which prevents startup.
-  Stop-Website -Name "LocalS3-IIS" -ErrorAction SilentlyContinue
-  Get-WebBinding -Name "LocalS3-IIS" | Remove-WebBinding -ErrorAction SilentlyContinue
+  Stop-Website -Name $siteName -ErrorAction SilentlyContinue
+  Get-WebBinding -Name $siteName | Remove-WebBinding -ErrorAction SilentlyContinue
   # Use non-SNI binding (SslFlags=0, no HostHeader) so HTTP.SYS uses per-IP (ipport) cert entries.
   # SNI (SslFlags=1) uses hostnameport entries that can silently fail to update across reinstalls.
-  New-WebBinding -Name "LocalS3-IIS" -Protocol "https" -Port $httpsPort -IPAddress "*" -HostHeader "" -SslFlags 0 | Out-Null
+  New-WebBinding -Name $siteName -Protocol "https" -Port $httpsPort -IPAddress "*" -HostHeader "" -SslFlags 0 | Out-Null
   # Associate SSL cert via AddSslCertificate (IIS-native: stores cert in IIS config AND HTTP.sys).
   # Pure-netsh cert registration conflicts with IIS's own cert registration on Start-Website,
   # causing the site to remain in Stopped state. Use AddSslCertificate to keep them in sync.
-  $mainBind = Get-WebBinding -Name "LocalS3-IIS" -Protocol "https" | Where-Object { $_.bindingInformation -eq "*:${httpsPort}:" } | Select-Object -First 1
+  $mainBind = Get-WebBinding -Name $siteName -Protocol "https" | Where-Object { $_.bindingInformation -eq "*:${httpsPort}:" } | Select-Object -First 1
   if ($mainBind) {
     try { $mainBind.AddSslCertificate($thumb, "My") } catch { Warn "AddSslCertificate (main): $($_.Exception.Message)" }
   }
+  New-WebBinding -Name $siteName -Protocol "https" -Port $consoleHttpsPort -IPAddress "*" -HostHeader "" -SslFlags 0 | Out-Null
+  $consoleBind = Get-WebBinding -Name $siteName -Protocol "https" | Where-Object { $_.bindingInformation -eq "*:${consoleHttpsPort}:" } | Select-Object -First 1
+  if ($consoleBind) {
+    try { $consoleBind.AddSslCertificate($thumb, "My") } catch { Warn "AddSslCertificate (console): $($_.Exception.Message)" }
+  }
   if ($lanIp) {
-    New-WebBinding -Name "LocalS3-IIS" -Protocol "https" -Port $httpsPort -IPAddress $lanIp -HostHeader "" -SslFlags 0 | Out-Null
-    $ipBind = Get-WebBinding -Name "LocalS3-IIS" -Protocol "https" | Where-Object { $_.bindingInformation -eq "${lanIp}:${httpsPort}:" } | Select-Object -First 1
-    if ($ipBind) {
-      try { $ipBind.AddSslCertificate($thumb, "My") } catch { Warn "AddSslCertificate (LAN IP): $($_.Exception.Message)" }
+    New-WebBinding -Name $siteName -Protocol "https" -Port $httpsPort -IPAddress $lanIp -HostHeader "" -SslFlags 0 | Out-Null
+    $apiIpBind = Get-WebBinding -Name $siteName -Protocol "https" | Where-Object { $_.bindingInformation -eq "${lanIp}:${httpsPort}:" } | Select-Object -First 1
+    if ($apiIpBind) {
+      try { $apiIpBind.AddSslCertificate($thumb, "My") } catch { Warn "AddSslCertificate (LAN API): $($_.Exception.Message)" }
+    }
+    New-WebBinding -Name $siteName -Protocol "https" -Port $consoleHttpsPort -IPAddress $lanIp -HostHeader "" -SslFlags 0 | Out-Null
+    $consoleIpBind = Get-WebBinding -Name $siteName -Protocol "https" | Where-Object { $_.bindingInformation -eq "${lanIp}:${consoleHttpsPort}:" } | Select-Object -First 1
+    if ($consoleIpBind) {
+      try { $consoleIpBind.AddSslCertificate($thumb, "My") } catch { Warn "AddSslCertificate (LAN console): $($_.Exception.Message)" }
     }
   }
 
   $ErrorActionPreference = "Continue"
   Start-Service W3SVC 2>$null | Out-Null
   Start-WebAppPool -Name "DefaultAppPool" -ErrorAction SilentlyContinue | Out-Null
-  try { Start-Website -Name "LocalS3-IIS" } catch { Warn "Start-Website error: $($_.Exception.Message)" }
+  try { Start-Website -Name $siteName } catch { Warn "Start-Website error: $($_.Exception.Message)" }
   $ErrorActionPreference = "Stop"
 
   if (-not (Wait-TcpPort -targetHost "127.0.0.1" -port $httpsPort -maxSeconds 30)) {
     Err "IIS HTTPS listener on port $httpsPort is not reachable."
     Warn "IIS site state:"
-    Get-Website -Name "LocalS3-IIS" | Format-List * | Out-String | Write-Host
+    Get-Website -Name $siteName | Format-List * | Out-String | Write-Host
     Warn "Check if another app is blocking port $httpsPort."
+    exit 1
+  }
+  if (-not (Wait-TcpPort -targetHost "127.0.0.1" -port $consoleHttpsPort -maxSeconds 30)) {
+    Err "IIS console HTTPS listener on port $consoleHttpsPort is not reachable."
+    Warn "IIS site state:"
+    Get-Website -Name $siteName | Format-List * | Out-String | Write-Host
+    Warn "Check if another app is blocking port $consoleHttpsPort."
     exit 1
   }
 
   if ($domain -ne "localhost") { Ensure-HostsEntry -domain $domain }
-  if ($lanIp) { Ensure-FirewallPort -port $httpsPort }
+  if ($lanIp) {
+    Ensure-FirewallPort -port $httpsPort
+    Ensure-FirewallPort -port $consoleHttpsPort
+  }
 
   $proxyUri = if ($httpsPort -eq 443) { "https://$domain/" } else { "https://${domain}:$httpsPort/" }
+  $consoleProxyUri = if ($consoleHttpsPort -eq 443) { "https://$domain/" } else { "https://${domain}:$consoleHttpsPort/" }
   if (-not (Test-HttpReachable -uri $proxyUri)) {
     Warn "IIS HTTPS endpoint probe failed: $proxyUri"
     Warn "Check IIS logs/Event Viewer and confirm URL Rewrite + ARR are installed and enabled."
   }
-}
-
-function Ensure-IISConsoleSite([string]$consoleSiteRoot,[int]$consoleHttpsPort,[int]$uiPort,[string]$lanIp,[string]$certThumb) {
-  Import-Module WebAdministration
-  New-Item -ItemType Directory -Force -Path $consoleSiteRoot | Out-Null
-  $consoleWebConfig = @"
-<?xml version="1.0" encoding="utf-8"?>
-<configuration>
-  <system.webServer>
-    <security>
-      <requestFiltering>
-        <requestLimits maxAllowedContentLength="4294967295" />
-      </requestFiltering>
-    </security>
-    <rewrite>
-      <rules>
-        <rule name="MinIOConsoleProxy" stopProcessing="true">
-          <match url="(.*)" />
-          <serverVariables>
-            <set name="HTTP_X_FORWARDED_PROTO" value="https" />
-            <set name="HTTP_X_FORWARDED_HOST" value="{HTTP_HOST}" />
-            <set name="HTTP_X_FORWARDED_FOR" value="{REMOTE_ADDR}" />
-          </serverVariables>
-          <action type="Rewrite" url="http://127.0.0.1:$uiPort/{R:1}" />
-        </rule>
-      </rules>
-    </rewrite>
-  </system.webServer>
-</configuration>
-"@
-  [System.IO.File]::WriteAllText((Join-Path $consoleSiteRoot "web.config"), $consoleWebConfig, (New-Object System.Text.UTF8Encoding($false)))
-
-  if (Test-Path "IIS:\Sites\LocalS3-Console") { Remove-Website -Name "LocalS3-Console" }
-  New-Website -Name "LocalS3-Console" -PhysicalPath $consoleSiteRoot -Port 80 -Force | Out-Null
-  Stop-Website -Name "LocalS3-Console" -ErrorAction SilentlyContinue
-  Get-WebBinding -Name "LocalS3-Console" | Remove-WebBinding
-  New-WebBinding -Name "LocalS3-Console" -Protocol "https" -Port $consoleHttpsPort -HostHeader "localhost" -SslFlags 0 | Out-Null
-  (Get-WebBinding -Name "LocalS3-Console" -Protocol "https" -Port $consoleHttpsPort -HostHeader "localhost").AddSslCertificate($certThumb, "My")
-  if ($lanIp) {
-    New-WebBinding -Name "LocalS3-Console" -Protocol "https" -Port $consoleHttpsPort -IPAddress $lanIp -HostHeader "" -SslFlags 0 | Out-Null
-    $ipBind = Get-WebBinding -Name "LocalS3-Console" -Protocol "https" | Where-Object { $_.bindingInformation -eq "${lanIp}:${consoleHttpsPort}:" } | Select-Object -First 1
-    if ($ipBind) { $ipBind.AddSslCertificate($certThumb, "My") }
-    # netsh SSL bindings for the IP:port and wildcard
-    $appId = "{$(New-Guid)}"
-    netsh http delete sslcert ipport="0.0.0.0:$consoleHttpsPort" 2>$null | Out-Null
-    netsh http delete sslcert ipport="${lanIp}:${consoleHttpsPort}" 2>$null | Out-Null
-    netsh http add sslcert ipport="0.0.0.0:$consoleHttpsPort" certhash=$certThumb appid=$appId certstorename=MY 2>&1 | Out-Null
-    netsh http add sslcert ipport="${lanIp}:${consoleHttpsPort}" certhash=$certThumb appid=$appId certstorename=MY 2>&1 | Out-Null
-    Ensure-FirewallPort -port $consoleHttpsPort
+  if (-not (Test-HttpReachable -uri $consoleProxyUri)) {
+    Warn "IIS console HTTPS endpoint probe failed: $consoleProxyUri"
+    Warn "Check IIS logs/Event Viewer and confirm URL Rewrite + ARR are installed and enabled."
   }
-  Start-Website -Name "LocalS3-Console" -ErrorAction SilentlyContinue
-  Info "MinIO console HTTPS site created on port $consoleHttpsPort."
 }
 
 function Install-IISMode {
@@ -1035,29 +1031,21 @@ function Install-IISMode {
     $uiPort = Resolve-RequiredPort -label "MinIO Console UI" -candidates @() -defaultPort ($apiPort + 1)
   }
   # Console HTTPS proxy port: try httpsPort+1000 range (e.g. 8443→9443)
-  # Exclude $httpsPort from candidates to prevent the API site and console site from both resolving to the same port.
+  # Exclude $httpsPort so the API and console bindings do not collide.
   $consoleCandidates = @(9443,10443,11443,12443,13443) | Where-Object { $_ -ne $httpsPort }
   $consoleHttpsPort = Resolve-RequiredPort -label "MinIO Console HTTPS" -candidates $consoleCandidates -defaultPort ($httpsPort + 1000)
 
   Run-PreflightChecks -DataPath $root
 
   $publicUrl = if ($httpsPort -eq 443) { "https://$domain" } else { "https://${domain}:$httpsPort" }
-  # Console browser URL: prefer LAN IP so it works on all devices; fall back to localhost
-  $consoleBrowserUrl = if ($lanIp) {
-    if ($consoleHttpsPort -eq 443) { "https://$lanIp" } else { "https://${lanIp}:$consoleHttpsPort" }
-  } else {
-    if ($consoleHttpsPort -eq 443) { "https://localhost" } else { "https://localhost:$consoleHttpsPort" }
-  }
+  # Keep the console on the chosen host name for a cleaner, consistent login URL.
+  $consoleBrowserUrl = if ($consoleHttpsPort -eq 443) { "https://$domain" } else { "https://${domain}:$consoleHttpsPort" }
 
   Ensure-IISInstalled
   Ensure-MinIONative -root $root -apiPort $apiPort -uiPort $uiPort -publicUrl $publicUrl -consoleBrowserUrl $consoleBrowserUrl
   $crt = Join-Path $certDir "localhost.crt"
   $key = Join-Path $certDir "localhost.key"
-  Ensure-IISProxyMode -domain $domain -siteRoot $siteRoot -certPath $crt -keyPath $key -httpsPort $httpsPort -targetPort $apiPort -lanIp $lanIp
-
-  # Create separate HTTPS console proxy site
-  $consoleSiteRoot = Join-Path $root "iis-console-site"
-  Ensure-IISConsoleSite -consoleSiteRoot $consoleSiteRoot -consoleHttpsPort $consoleHttpsPort -uiPort $uiPort -lanIp $lanIp -certThumb $Script:IISCertThumb
+  Ensure-IISProxyMode -domain $domain -siteRoot $siteRoot -certPath $crt -keyPath $key -httpsPort $httpsPort -targetPort $apiPort -consoleHttpsPort $consoleHttpsPort -uiPort $uiPort -lanIp $lanIp
 
   # Auto-configure buckets, CORS, service accounts
   Configure-MinIOFeatures -ApiPort $apiPort -UiPort $uiPort
@@ -1463,7 +1451,9 @@ function Has-ExistingLocalS3IISInstall {
   $exists = $false
   try {
     Import-Module WebAdministration -ErrorAction SilentlyContinue
-    if (Test-Path "IIS:\Sites\LocalS3-IIS") { $exists = $true }
+    foreach ($siteName in @("LocalS3", "LocalS3-IIS", "LocalS3-Console")) {
+      if (Test-Path "IIS:\Sites\$siteName") { $exists = $true; break }
+    }
   } catch {}
 
   $prev = $ErrorActionPreference
@@ -1482,7 +1472,7 @@ function Remove-ExistingLocalS3IISInstall([string]$root, [switch]$DeleteData) {
 
   try {
     Import-Module WebAdministration -ErrorAction SilentlyContinue
-    foreach ($siteName in @("LocalS3-IIS", "LocalS3-Console")) {
+    foreach ($siteName in @("LocalS3", "LocalS3-IIS", "LocalS3-Console")) {
       if (Test-Path "IIS:\Sites\$siteName") {
         Stop-Website -Name $siteName 2>$null | Out-Null
         Remove-Website -Name $siteName 2>$null | Out-Null
