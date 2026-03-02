@@ -1624,7 +1624,7 @@ function Trust-LocalTlsCert([string]$certPath) {
   }
 }
 
-function Start-ContainersFallback([string]$dockerCtx, [string]$ngconf, [string]$ngcerts, [string]$minioVolume, [int]$nginxHttpsPort, [int]$minioApi, [int]$minioUI) {
+function Start-ContainersFallback([string]$dockerCtx, [string]$ngconf, [string]$ngcerts, [string]$minioVolume, [int]$consoleHttpsPort, [int]$apiHttpsPort, [int]$minioApi, [int]$minioUI, [string]$consoleProxyUrl) {
   Warn "Falling back to direct 'docker run' startup (compose unavailable in this environment)."
   $network = "storage-net"
 
@@ -1641,6 +1641,7 @@ function Start-ContainersFallback([string]$dockerCtx, [string]$ngconf, [string]$
     --network $network `
     -e MINIO_ROOT_USER=admin `
     -e MINIO_ROOT_PASSWORD=StrongPassword123 `
+    -e MINIO_BROWSER_REDIRECT_URL="${consoleProxyUrl}" `
     -p "${minioApi}:9000" `
     -p "${minioUI}:9001" `
     -v "${minioVolume}:/data" `
@@ -1657,7 +1658,8 @@ function Start-ContainersFallback([string]$dockerCtx, [string]$ngconf, [string]$
     --label $Script:LocalS3Label `
     --label "com.locals3.role=nginx" `
     --network $network `
-    -p "${nginxHttpsPort}:443" `
+    -p "${consoleHttpsPort}:443" `
+    -p "${apiHttpsPort}:4443" `
     -v "${ngconf}:/etc/nginx/conf.d:ro" `
     -v "${ngcerts}:/etc/nginx/certs:ro" `
     nginx:latest | Out-Null
@@ -1726,10 +1728,20 @@ function Write-FilesAndUp {
   }
   if (-not $minioApi)  { Err "No free port for MinIO API (9000/19000/29000)."; exit 1 }
   if (-not $minioUI)   { Err "No free port for MinIO UI (9001/19001/29001)."; exit 1 }
-  if ($enableLan) { Ensure-FirewallPort -port $nginxHttps }
+  $apiHttpsCandidates = @(8443,9443,10443,11443,12443) | Where-Object { $_ -ne $nginxHttps }
+  $apiHttpsDefault = if ($nginxHttps -eq 8443) { 9443 } else { 8443 }
+  $apiHttps = Resolve-RequiredPort -label "HTTPS S3 API" -candidates $apiHttpsCandidates -defaultPort $apiHttpsDefault
+  if ($enableLan) {
+    Ensure-FirewallPort -port $nginxHttps
+    Ensure-FirewallPort -port $apiHttps
+  }
+
+  $consoleProxyUrl = if ($nginxHttps -eq 443) { "https://$domain" } else { "https://${domain}:$nginxHttps" }
+  $apiProxyUrl = if ($apiHttps -eq 443) { "https://$domain" } else { "https://${domain}:$apiHttps" }
 
   Info "Using ports:"
-  Info " - Nginx HTTPS: $nginxHttps"
+  Info " - Console HTTPS: $nginxHttps"
+  Info " - S3 API HTTPS: $apiHttps"
   Info " - MinIO API:  $minioApi"
   Info " - MinIO UI:   $minioUI"
 
@@ -1753,7 +1765,7 @@ services:
       MINIO_ROOT_USER: admin
       MINIO_ROOT_PASSWORD: StrongPassword123
       MINIO_PROMETHEUS_AUTH_TYPE: public
-      MINIO_BROWSER_REDIRECT_URL: ""
+      MINIO_BROWSER_REDIRECT_URL: "$consoleProxyUrl"
     volumes:
       - ${minioVolume}:/data
     ports:
@@ -1779,6 +1791,7 @@ services:
       - "com.locals3.role=nginx"
     ports:
       - "$nginxHttps:443"
+      - "$apiHttps:4443"
     volumes:
       - ./nginx/conf:/etc/nginx/conf.d:ro
       - ./nginx/certs:/etc/nginx/certs:ro
@@ -1838,9 +1851,32 @@ server {
         proxy_buffering    off;
     }
 
-    # MinIO S3 API (for SDK / CLI / programmatic access via /s3/)
-    location /s3/ {
-        rewrite ^/s3/(.*) /`$1 break;
+}
+
+server {
+    listen 4443 ssl;
+    http2 on;
+    server_name $serverNames;
+
+    ssl_certificate     /etc/nginx/certs/localhost.crt;
+    ssl_certificate_key /etc/nginx/certs/localhost.key;
+
+    ssl_protocols       TLSv1.2 TLSv1.3;
+    ssl_ciphers         HIGH:!aNULL:!MD5;
+    ssl_prefer_server_ciphers on;
+    ssl_session_cache   shared:SSL:10m;
+    ssl_session_timeout 10m;
+
+    add_header Strict-Transport-Security "max-age=31536000; includeSubDomains" always;
+    add_header X-Frame-Options SAMEORIGIN always;
+    add_header X-Content-Type-Options nosniff always;
+    add_header X-XSS-Protection "1; mode=block" always;
+    add_header Referrer-Policy no-referrer-when-downgrade always;
+
+    client_max_body_size 5g;
+
+    # Dedicated HTTPS S3 API endpoint
+    location / {
         proxy_pass         http://minio:9000;
         proxy_http_version 1.1;
         proxy_set_header Host            `$http_host;
@@ -1887,7 +1923,7 @@ server {
     if ($composeText -match "invalid proto:") {
       Warn "Detected compose transport error ('invalid proto:')."
       Pop-Location
-      Start-ContainersFallback -dockerCtx $dockerCtx -ngconf $ngconf -ngcerts $ngcerts -minioVolume $minioVolume -nginxHttpsPort $nginxHttps -minioApi $minioApi -minioUI $minioUI
+      Start-ContainersFallback -dockerCtx $dockerCtx -ngconf $ngconf -ngcerts $ngcerts -minioVolume $minioVolume -consoleHttpsPort $nginxHttps -apiHttpsPort $apiHttps -minioApi $minioApi -minioUI $minioUI -consoleProxyUrl $consoleProxyUrl
       $usedFallback = $true
     } else {
       Warn "Showing compose logs..."
@@ -1956,18 +1992,19 @@ server {
 
   Pop-Location
 
-  $proxyUrl = if ($nginxHttps -eq 443) { "https://$domain" } else { "https://${domain}:$nginxHttps" }
   Write-Host ""
   Write-Host "===== INSTALLATION COMPLETE ====="
   Write-Host ""
   Write-Host "URLs:"
   Write-Host "  MinIO Console (dashboard): http://localhost:$minioUI"
   Write-Host "  MinIO API (S3):            http://localhost:$minioApi"
-  Write-Host "  HTTPS Proxy (console):     $proxyUrl"
-  Write-Host "  HTTPS S3 API route:        $proxyUrl/s3/"
+  Write-Host "  HTTPS Console:             $consoleProxyUrl"
+  Write-Host "  HTTPS S3 API:              $apiProxyUrl"
   if ($enableLan -and $lanIp) {
-    $lanUrl = if ($nginxHttps -eq 443) { "https://$lanIp" } else { "https://${lanIp}:$nginxHttps" }
-    Write-Host "  LAN URL:                   $lanUrl"
+    $lanConsoleUrl = if ($nginxHttps -eq 443) { "https://$lanIp" } else { "https://${lanIp}:$nginxHttps" }
+    $lanApiUrl = if ($apiHttps -eq 443) { "https://$lanIp" } else { "https://${lanIp}:$apiHttps" }
+    Write-Host "  LAN Console:               $lanConsoleUrl"
+    Write-Host "  LAN S3 API:                $lanApiUrl"
   }
   Write-Host ""
   Write-Host "Login:"
@@ -1994,11 +2031,21 @@ server {
       } else {
         Write-Host "  Then open: https://${domain}:$nginxHttps"
       }
+      if ($apiHttps -eq 443) {
+        Write-Host "  S3 API: https://$domain"
+      } else {
+        Write-Host "  S3 API: https://${domain}:$apiHttps"
+      }
     } else {
       if ($nginxHttps -eq 443) {
         Write-Host "  Open: https://$lanIp"
       } else {
         Write-Host "  Open: https://${lanIp}:$nginxHttps"
+      }
+      if ($apiHttps -eq 443) {
+        Write-Host "  S3 API: https://$lanIp"
+      } else {
+        Write-Host "  S3 API: https://${lanIp}:$apiHttps"
       }
     }
     Write-Host "  Trust cert on client: $($ngcerts)\localhost.crt"

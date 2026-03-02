@@ -73,8 +73,10 @@ Linux/macOS installer is native (no Docker required).
 ## Access URLs
 
 After installation, script output shows:
-- Proxy URL (HTTPS): `https://<domain>` or `https://<domain>:<port>`
-- LAN URL: `https://<server-lan-ip>` (if enabled)
+- MinIO Console HTTPS: `https://<domain>` or `https://<domain>:<console-port>`
+- S3 API HTTPS: `https://<domain>:<api-port>` (or `https://<domain>` when `443` is used)
+- LAN Console URL: `https://<server-lan-ip>` or `https://<server-lan-ip>:<console-port>` (if enabled)
+- LAN S3 API URL: `https://<server-lan-ip>:<api-port>` (if enabled)
 - MinIO Console direct URL: `http://localhost:<minio-ui-port>`
 - MinIO API direct URL: `http://localhost:<minio-api-port>`
 
