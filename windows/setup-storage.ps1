@@ -896,6 +896,10 @@ function Ensure-IISProxyMode([string]$domain,[string]$siteRoot,[string]$certPath
     Remove-Website -Name "LocalS3-IIS"
   }
   New-Website -Name "LocalS3-IIS" -PhysicalPath $siteRoot -Port 80 -Force | Out-Null
+  # Stop and remove all bindings (including the default HTTP port-80) before adding only HTTPS.
+  # Leaving the port-80 binding causes a conflict with Default Web Site, which prevents startup.
+  Stop-Website -Name "LocalS3-IIS" -ErrorAction SilentlyContinue
+  Get-WebBinding -Name "LocalS3-IIS" | Remove-WebBinding -ErrorAction SilentlyContinue
   # Use non-SNI binding (SslFlags=0, no HostHeader) so HTTP.SYS uses ipport netsh entries.
   # SNI (SslFlags=1) relies on hostnameport entries that can silently fail to update across reinstalls.
   New-WebBinding -Name "LocalS3-IIS" -Protocol "https" -Port $httpsPort -IPAddress "*" -HostHeader "" -SslFlags 0 | Out-Null
@@ -909,7 +913,8 @@ function Ensure-IISProxyMode([string]$domain,[string]$siteRoot,[string]$certPath
 
   $ErrorActionPreference = "Continue"
   Start-Service W3SVC 2>$null | Out-Null
-  Start-Website -Name "LocalS3-IIS" 2>$null | Out-Null
+  Start-WebAppPool -Name "DefaultAppPool" -ErrorAction SilentlyContinue | Out-Null
+  Start-Website -Name "LocalS3-IIS" -ErrorAction SilentlyContinue | Out-Null
   $ErrorActionPreference = "Stop"
 
   if (-not (Wait-TcpPort -targetHost "127.0.0.1" -port $httpsPort -maxSeconds 30)) {
