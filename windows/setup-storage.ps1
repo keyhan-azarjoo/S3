@@ -665,7 +665,7 @@ function Ensure-MinIONative([string]$root,[int]$apiPort,[int]$uiPort,[string]$pu
 
   $runnerBody = @"
 @echo off
-set MINIO_SERVER_URL=$publicUrl
+set MINIO_SERVER_URL=
 set MINIO_BROWSER_REDIRECT_URL=$consoleBrowserUrl
 set MINIO_CONSOLE_REDIRECT_URL=
 set MINIO_ROOT_USER=admin
