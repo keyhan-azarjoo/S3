@@ -900,21 +900,28 @@ function Ensure-IISProxyMode([string]$domain,[string]$siteRoot,[string]$certPath
   # Leaving the port-80 binding causes a conflict with Default Web Site, which prevents startup.
   Stop-Website -Name "LocalS3-IIS" -ErrorAction SilentlyContinue
   Get-WebBinding -Name "LocalS3-IIS" | Remove-WebBinding -ErrorAction SilentlyContinue
-  # Use non-SNI binding (SslFlags=0, no HostHeader) so HTTP.SYS uses ipport netsh entries.
-  # SNI (SslFlags=1) relies on hostnameport entries that can silently fail to update across reinstalls.
+  # Use non-SNI binding (SslFlags=0, no HostHeader) so HTTP.SYS uses per-IP (ipport) cert entries.
+  # SNI (SslFlags=1) uses hostnameport entries that can silently fail to update across reinstalls.
   New-WebBinding -Name "LocalS3-IIS" -Protocol "https" -Port $httpsPort -IPAddress "*" -HostHeader "" -SslFlags 0 | Out-Null
-  $appId = "{$(New-Guid)}"
-  # Bind cert explicitly via netsh — more reliable than AddSslCertificate across reinstalls
-  netsh http add sslcert ipport="0.0.0.0:$httpsPort" certhash=$thumb appid=$appId certstorename=MY 2>&1 | Out-Null
+  # Associate SSL cert via AddSslCertificate (IIS-native: stores cert in IIS config AND HTTP.sys).
+  # Pure-netsh cert registration conflicts with IIS's own cert registration on Start-Website,
+  # causing the site to remain in Stopped state. Use AddSslCertificate to keep them in sync.
+  $mainBind = Get-WebBinding -Name "LocalS3-IIS" -Protocol "https" | Where-Object { $_.bindingInformation -eq "*:${httpsPort}:" } | Select-Object -First 1
+  if ($mainBind) {
+    try { $mainBind.AddSslCertificate($thumb, "My") } catch { Warn "AddSslCertificate (main): $($_.Exception.Message)" }
+  }
   if ($lanIp) {
     New-WebBinding -Name "LocalS3-IIS" -Protocol "https" -Port $httpsPort -IPAddress $lanIp -HostHeader "" -SslFlags 0 | Out-Null
-    netsh http add sslcert ipport="${lanIp}:${httpsPort}" certhash=$thumb appid=$appId certstorename=MY 2>&1 | Out-Null
+    $ipBind = Get-WebBinding -Name "LocalS3-IIS" -Protocol "https" | Where-Object { $_.bindingInformation -eq "${lanIp}:${httpsPort}:" } | Select-Object -First 1
+    if ($ipBind) {
+      try { $ipBind.AddSslCertificate($thumb, "My") } catch { Warn "AddSslCertificate (LAN IP): $($_.Exception.Message)" }
+    }
   }
 
   $ErrorActionPreference = "Continue"
   Start-Service W3SVC 2>$null | Out-Null
   Start-WebAppPool -Name "DefaultAppPool" -ErrorAction SilentlyContinue | Out-Null
-  Start-Website -Name "LocalS3-IIS" -ErrorAction SilentlyContinue | Out-Null
+  try { Start-Website -Name "LocalS3-IIS" } catch { Warn "Start-Website error: $($_.Exception.Message)" }
   $ErrorActionPreference = "Stop"
 
   if (-not (Wait-TcpPort -targetHost "127.0.0.1" -port $httpsPort -maxSeconds 30)) {
