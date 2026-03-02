@@ -43,6 +43,7 @@ normalize_host_input() {
   echo "$v"
 }
 
+
 port_free() {
   local p="$1"
   if has_cmd ss; then
