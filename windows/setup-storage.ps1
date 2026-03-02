@@ -725,13 +725,8 @@ set MINIO_API_ROOT_ACCESS=on
     $ErrorActionPreference = "Continue"
     schtasks /End /TN $taskName 1>$null 2>$null | Out-Null
     Get-Process -Name "minio" -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
-    if (Test-Path $dataDir) {
-      Warn "Resetting MinIO data folder: $dataDir"
-      Remove-Item -Recurse -Force -Path $dataDir -ErrorAction SilentlyContinue
-      New-Item -ItemType Directory -Force -Path $dataDir | Out-Null
-    }
     if (Test-Path $idDir) {
-      Warn "Removing MinIO identity metadata: $idDir"
+      Warn "Resetting MinIO identity metadata: $idDir"
       Remove-Item -Recurse -Force -Path $idDir -ErrorAction SilentlyContinue
     }
     if (Test-Path $configDir) {
@@ -1012,7 +1007,7 @@ function Install-IISMode {
     Warn ("Some default ports are busy (" + ($busyDefaults -join ", ") + ") and an existing LocalS3 IIS installation was detected.")
     $ans = (Read-Host "Delete previous LocalS3 IIS install and reinstall now? (Y/n)").Trim().ToLowerInvariant()
     if ($ans -eq "" -or $ans -eq "y" -or $ans -eq "yes") {
-      Remove-ExistingLocalS3IISInstall -root $root -DeleteData
+      Remove-ExistingLocalS3IISInstall -root $root
     } else {
       Warn "Keeping existing LocalS3 install. Installer will use alternate/custom ports as needed."
     }
@@ -1490,16 +1485,11 @@ function Remove-ExistingLocalS3IISInstall([string]$root, [switch]$DeleteData) {
   schtasks /Delete /TN "LocalS3-MinIO" /F 1>$null 2>$null | Out-Null
 
   Get-Process -Name "minio" -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
-  if ($DeleteData -and $root) {
-    $dataDir = Join-Path $root "data"
+  if ($root) {
     $configDir = Join-Path $root "config"
     $siteDir = Join-Path $root "iis-site"
+    $consoleSiteDir = Join-Path $root "iis-console-site"
     $certDir = Join-Path $root "nginx\certs"
-    if (Test-Path $dataDir) {
-      Warn "Deleting previous MinIO data to reset credentials and state..."
-      Remove-Item -Recurse -Force -Path $dataDir -ErrorAction SilentlyContinue
-      New-Item -ItemType Directory -Force -Path $dataDir | Out-Null
-    }
     if (Test-Path $configDir) {
       Warn "Deleting previous MinIO config state..."
       Remove-Item -Recurse -Force -Path $configDir -ErrorAction SilentlyContinue
@@ -1508,6 +1498,10 @@ function Remove-ExistingLocalS3IISInstall([string]$root, [switch]$DeleteData) {
     if (Test-Path $siteDir) {
       Remove-Item -Recurse -Force -Path $siteDir -ErrorAction SilentlyContinue
       New-Item -ItemType Directory -Force -Path $siteDir | Out-Null
+    }
+    if (Test-Path $consoleSiteDir) {
+      Remove-Item -Recurse -Force -Path $consoleSiteDir -ErrorAction SilentlyContinue
+      New-Item -ItemType Directory -Force -Path $consoleSiteDir | Out-Null
     }
     if (Test-Path $certDir) {
       Remove-Item -Recurse -Force -Path $certDir -ErrorAction SilentlyContinue
