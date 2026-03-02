@@ -564,7 +564,7 @@ function Ensure-IISInstalled {
   Info "IIS prerequisites installed successfully."
 }
 
-function Ensure-MinIONative([string]$root,[int]$apiPort,[int]$uiPort,[string]$publicUrl) {
+function Ensure-MinIONative([string]$root,[int]$apiPort,[int]$uiPort,[string]$publicUrl,[string]$consoleBrowserUrl="") {
   $Script:ActiveAccessKey = "admin"
   $Script:ActiveSecretKey = "StrongPassword123"
   $binDir = Join-Path $root "minio"
@@ -665,8 +665,8 @@ function Ensure-MinIONative([string]$root,[int]$apiPort,[int]$uiPort,[string]$pu
 
   $runnerBody = @"
 @echo off
-set MINIO_SERVER_URL=
-set MINIO_BROWSER_REDIRECT_URL=
+set MINIO_SERVER_URL=$publicUrl
+set MINIO_BROWSER_REDIRECT_URL=$consoleBrowserUrl
 set MINIO_CONSOLE_REDIRECT_URL=
 set MINIO_ROOT_USER=admin
 set MINIO_ROOT_PASSWORD=StrongPassword123
@@ -775,6 +775,7 @@ set MINIO_API_ROOT_ACCESS=on
 function Ensure-IISProxyMode([string]$domain,[string]$siteRoot,[string]$certPath,[string]$keyPath,[int]$httpsPort,[int]$targetPort,[string]$lanIp) {
   Import-Module WebAdministration
   $Script:IISCertIncludesIpSan = $false
+  $Script:IISCertThumb = ""
   New-Item -ItemType Directory -Force -Path $siteRoot | Out-Null
   $webConfig = @"
 <?xml version="1.0" encoding="utf-8"?>
@@ -835,23 +836,43 @@ function Ensure-IISProxyMode([string]$domain,[string]$siteRoot,[string]$certPath
     Warn "Could not update IIS Rewrite allowed server variables automatically. If proxy requests fail, allow HTTP_X_FORWARDED_PROTO/HOST/FOR in IIS Rewrite settings."
   }
 
-  $certDns = @("localhost",$domain) | Select-Object -Unique
+  # Build SAN: always include localhost + 127.0.0.1, plus domain and LAN IP if present
+  $sanExt = "2.5.29.17={text}DNS=localhost&IPAddress=127.0.0.1"
+  if ($domain -and $domain -ne "localhost") { $sanExt += "&DNS=$domain" }
+  if ($lanIp) { $sanExt += "&IPAddress=$lanIp" }
+
   $cert = $null
-  if ($lanIp) {
-    $san = "2.5.29.17={text}DNS=localhost"
-    if ($domain -and $domain -ne "localhost") { $san += "&DNS=$domain" }
-    $san += "&IPAddress=$lanIp"
-    try {
-      $cert = New-SelfSignedCertificate -DnsName $certDns -TextExtension $san -CertStoreLocation "Cert:\LocalMachine\My" -NotAfter (Get-Date).AddYears(2)
-      if ($cert) { $Script:IISCertIncludesIpSan = $true }
-    } catch {
-      Warn "Could not add IP SAN to certificate on this Windows build. Falling back to DNS-only cert."
-    }
+  # Method 1: New-SelfSignedCertificate with -Subject (no -DnsName) avoids TextExtension conflicts
+  try {
+    $cert = New-SelfSignedCertificate -Subject "CN=localhost" -TextExtension @($sanExt) `
+      -KeyAlgorithm RSA -KeyLength 2048 -FriendlyName "LocalS3-HTTPS" `
+      -CertStoreLocation "Cert:\LocalMachine\My" -NotAfter (Get-Date).AddYears(3)
+    if ($cert) { $Script:IISCertIncludesIpSan = $true; Info "Cert generated with IP SAN." }
+  } catch {
+    Warn "New-SelfSignedCertificate with IP SAN failed: $($_.Exception.Message)"
   }
+  # Method 2: certreq.exe fallback — works on all Windows versions
   if (-not $cert) {
-    $cert = New-SelfSignedCertificate -DnsName $certDns -CertStoreLocation "Cert:\LocalMachine\My" -NotAfter (Get-Date).AddYears(2)
+    try {
+      $infPath = Join-Path $env:TEMP "locals3-cert.inf"
+      $sanLines = "_continue_ = `"dns=localhost&`"`r`n_continue_ = `"ipaddress=127.0.0.1&`""
+      if ($domain -and $domain -ne "localhost") { $sanLines += "`r`n_continue_ = `"dns=$domain&`"" }
+      if ($lanIp) { $sanLines += "`r`n_continue_ = `"ipaddress=$lanIp&`"" }
+      $infContent = "[Version]`r`nSignature=`"`$Windows NT`$`"`r`n[NewRequest]`r`nSubject=`"CN=localhost`"`r`nKeyLength=2048`r`nKeyAlgorithm=RSA`r`nMachineKeySet=True`r`nRequestType=Cert`r`nValidityPeriod=Years`r`nValidityPeriodUnits=3`r`n[Extensions]`r`n2.5.29.17 = `"{text}`"`r`n$sanLines"
+      [System.IO.File]::WriteAllText($infPath, $infContent)
+      certreq -new -machine $infPath "$env:TEMP\locals3-cert.cer" 2>&1 | Out-Null
+      $cert = Get-ChildItem Cert:\LocalMachine\My | Where-Object { $_.Subject -eq "CN=localhost" } | Sort-Object NotBefore -Descending | Select-Object -First 1
+      if ($cert) { $Script:IISCertIncludesIpSan = $true; Info "Cert generated with IP SAN via certreq." }
+    } catch { Warn "certreq cert generation failed: $($_.Exception.Message)" }
+  }
+  # Final fallback: DNS-only cert
+  if (-not $cert) {
+    Warn "Falling back to DNS-only cert. LAN-IP HTTPS URLs will show a certificate warning."
+    $cert = New-SelfSignedCertificate -DnsName @("localhost",$domain | Select-Object -Unique) `
+      -CertStoreLocation "Cert:\LocalMachine\My" -NotAfter (Get-Date).AddYears(3)
   }
   $thumb = $cert.Thumbprint
+  $Script:IISCertThumb = $thumb
   Import-Certificate -FilePath (Export-Certificate -Cert "Cert:\LocalMachine\My\$thumb" -FilePath $certPath -Force).FullName -CertStoreLocation "Cert:\LocalMachine\Root" | Out-Null
 
   if (Test-Path "IIS:\Sites\LocalS3-IIS") {
@@ -895,6 +916,58 @@ function Ensure-IISProxyMode([string]$domain,[string]$siteRoot,[string]$certPath
   }
 }
 
+function Ensure-IISConsoleSite([string]$consoleSiteRoot,[int]$consoleHttpsPort,[int]$uiPort,[string]$lanIp,[string]$certThumb) {
+  Import-Module WebAdministration
+  New-Item -ItemType Directory -Force -Path $consoleSiteRoot | Out-Null
+  $consoleWebConfig = @"
+<?xml version="1.0" encoding="utf-8"?>
+<configuration>
+  <system.webServer>
+    <security>
+      <requestFiltering>
+        <requestLimits maxAllowedContentLength="4294967295" />
+      </requestFiltering>
+    </security>
+    <rewrite>
+      <rules>
+        <rule name="MinIOConsoleProxy" stopProcessing="true">
+          <match url="(.*)" />
+          <serverVariables>
+            <set name="HTTP_X_FORWARDED_PROTO" value="https" />
+            <set name="HTTP_X_FORWARDED_HOST" value="{HTTP_HOST}" />
+            <set name="HTTP_X_FORWARDED_FOR" value="{REMOTE_ADDR}" />
+          </serverVariables>
+          <action type="Rewrite" url="http://127.0.0.1:$uiPort/{R:1}" />
+        </rule>
+      </rules>
+    </rewrite>
+  </system.webServer>
+</configuration>
+"@
+  [System.IO.File]::WriteAllText((Join-Path $consoleSiteRoot "web.config"), $consoleWebConfig, (New-Object System.Text.UTF8Encoding($false)))
+
+  if (Test-Path "IIS:\Sites\LocalS3-Console") { Remove-Website -Name "LocalS3-Console" }
+  New-Website -Name "LocalS3-Console" -PhysicalPath $consoleSiteRoot -Port 80 -Force | Out-Null
+  Stop-Website -Name "LocalS3-Console" -ErrorAction SilentlyContinue
+  Get-WebBinding -Name "LocalS3-Console" | Remove-WebBinding
+  New-WebBinding -Name "LocalS3-Console" -Protocol "https" -Port $consoleHttpsPort -HostHeader "localhost" -SslFlags 0 | Out-Null
+  (Get-WebBinding -Name "LocalS3-Console" -Protocol "https" -Port $consoleHttpsPort -HostHeader "localhost").AddSslCertificate($certThumb, "My")
+  if ($lanIp) {
+    New-WebBinding -Name "LocalS3-Console" -Protocol "https" -Port $consoleHttpsPort -IPAddress $lanIp -HostHeader "" -SslFlags 0 | Out-Null
+    $ipBind = Get-WebBinding -Name "LocalS3-Console" -Protocol "https" | Where-Object { $_.bindingInformation -eq "${lanIp}:${consoleHttpsPort}:" } | Select-Object -First 1
+    if ($ipBind) { $ipBind.AddSslCertificate($certThumb, "My") }
+    # netsh SSL bindings for the IP:port and wildcard
+    $appId = "{$(New-Guid)}"
+    netsh http delete sslcert ipport="0.0.0.0:$consoleHttpsPort" 2>$null | Out-Null
+    netsh http delete sslcert ipport="${lanIp}:${consoleHttpsPort}" 2>$null | Out-Null
+    netsh http add sslcert ipport="0.0.0.0:$consoleHttpsPort" certhash=$certThumb appid=$appId certstorename=MY 2>&1 | Out-Null
+    netsh http add sslcert ipport="${lanIp}:${consoleHttpsPort}" certhash=$certThumb appid=$appId certstorename=MY 2>&1 | Out-Null
+    Ensure-FirewallPort -port $consoleHttpsPort
+  }
+  Start-Website -Name "LocalS3-Console" -ErrorAction SilentlyContinue
+  Info "MinIO console HTTPS site created on port $consoleHttpsPort."
+}
+
 function Install-IISMode {
   $root = Join-Path $env:ProgramData "LocalS3\storage-server"
   $certDir = Join-Path $root "nginx\certs"
@@ -935,15 +1008,28 @@ function Install-IISMode {
     Warn "MinIO UI port cannot equal API port ($apiPort)."
     $uiPort = Resolve-RequiredPort -label "MinIO Console UI" -candidates @() -defaultPort ($apiPort + 1)
   }
+  # Console HTTPS proxy port: try httpsPort+1000 range (e.g. 8443→9443)
+  $consoleHttpsPort = Resolve-RequiredPort -label "MinIO Console HTTPS" -candidates @(9443,10443,11443,12443,13443) -defaultPort ($httpsPort + 1000)
 
   Run-PreflightChecks -DataPath $root
 
   $publicUrl = if ($httpsPort -eq 443) { "https://$domain" } else { "https://${domain}:$httpsPort" }
+  # Console browser URL: prefer LAN IP so it works on all devices; fall back to localhost
+  $consoleBrowserUrl = if ($lanIp) {
+    if ($consoleHttpsPort -eq 443) { "https://$lanIp" } else { "https://${lanIp}:$consoleHttpsPort" }
+  } else {
+    if ($consoleHttpsPort -eq 443) { "https://localhost" } else { "https://localhost:$consoleHttpsPort" }
+  }
+
   Ensure-IISInstalled
-  Ensure-MinIONative -root $root -apiPort $apiPort -uiPort $uiPort -publicUrl $publicUrl
+  Ensure-MinIONative -root $root -apiPort $apiPort -uiPort $uiPort -publicUrl $publicUrl -consoleBrowserUrl $consoleBrowserUrl
   $crt = Join-Path $certDir "localhost.crt"
   $key = Join-Path $certDir "localhost.key"
-  Ensure-IISProxyMode -domain $domain -siteRoot $siteRoot -certPath $crt -keyPath $key -httpsPort $httpsPort -targetPort $uiPort -lanIp $lanIp
+  Ensure-IISProxyMode -domain $domain -siteRoot $siteRoot -certPath $crt -keyPath $key -httpsPort $httpsPort -targetPort $apiPort -lanIp $lanIp
+
+  # Create separate HTTPS console proxy site
+  $consoleSiteRoot = Join-Path $root "iis-console-site"
+  Ensure-IISConsoleSite -consoleSiteRoot $consoleSiteRoot -consoleHttpsPort $consoleHttpsPort -uiPort $uiPort -lanIp $lanIp -certThumb $Script:IISCertThumb
 
   # Auto-configure buckets, CORS, service accounts
   Configure-MinIOFeatures -ApiPort $apiPort -UiPort $uiPort
@@ -952,24 +1038,12 @@ function Install-IISMode {
   Write-Host "===== INSTALLATION COMPLETE (IIS MODE) ====="
   Write-Host ""
   Write-Host "URLs:"
-  Write-Host "  MinIO Console (direct): http://localhost:$uiPort"
-  Write-Host "  MinIO API (direct):     http://localhost:$apiPort"
-  if ($httpsPort -eq 443) {
-    Write-Host "  IIS Proxy URL:          https://$domain"
-  } else {
-    Write-Host "  IIS Proxy URL:          https://${domain}:$httpsPort"
-  }
+  Write-Host "  MinIO Console HTTPS:    $consoleBrowserUrl"
+  Write-Host "  S3 API / Share links:   $publicUrl"
   if ($enableLan -and $lanIp) {
-    if ($httpsPort -eq 443) {
-      Write-Host "  LAN URL:                https://$lanIp"
-    } else {
-      Write-Host "  LAN URL:                https://${lanIp}:$httpsPort"
-    }
+    Write-Host "  LAN Console:            https://${lanIp}:$consoleHttpsPort"
+    Write-Host "  LAN S3 API:             https://${lanIp}:$httpsPort"
     Write-Host "  For DNS: map $domain -> $lanIp"
-    if (-not $Script:IISCertIncludesIpSan) {
-      Warn "TLS cert does not include LAN IP SAN on this Windows build."
-      Warn "Use the domain URL for HTTPS. LAN-IP URL may show certificate name mismatch."
-    }
   }
   Write-Host ""
   Write-Host "Login:"
