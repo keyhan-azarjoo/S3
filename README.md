@@ -57,7 +57,9 @@ Script reference:
 One-line run from GitHub (PowerShell):
 
 ```powershell
-powershell -NoProfile -ExecutionPolicy Bypass -Command "$script = Join-Path $env:TEMP 'setup-storage.ps1'; Invoke-WebRequest -Uri 'https://raw.githubusercontent.com/keyhan-azarjoo/S3/main/windows/setup-storage.ps1' -OutFile $script; & $script"
+$script = Join-Path $env:TEMP 'setup-storage.ps1'
+Invoke-WebRequest -Uri 'https://raw.githubusercontent.com/keyhan-azarjoo/S3/main/windows/setup-storage.ps1' -OutFile $script
+& $script
 ```
 
 ## Linux/macOS Usage
