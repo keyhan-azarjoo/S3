@@ -836,6 +836,22 @@ function Ensure-IISProxyMode([string]$domain,[string]$siteRoot,[string]$certPath
     Warn "Could not update IIS Rewrite allowed server variables automatically. If proxy requests fail, allow HTTP_X_FORWARDED_PROTO/HOST/FOR in IIS Rewrite settings."
   }
 
+  # Remove ALL old LocalS3 certs from both stores before generating new ones.
+  # This prevents Go (MinIO) from finding an old non-CA cert in the Root store and failing
+  # with "parent certificate cannot sign this kind of certificate".
+  Get-ChildItem Cert:\LocalMachine\My   | Where-Object { $_.FriendlyName -eq "LocalS3-HTTPS" } | Remove-Item -Force -ErrorAction SilentlyContinue
+  Get-ChildItem Cert:\LocalMachine\Root | Where-Object { $_.FriendlyName -eq "LocalS3-HTTPS" } | Remove-Item -Force -ErrorAction SilentlyContinue
+  # Clean up ALL netsh SSL bindings for this port (both SNI hostnameport and non-SNI ipport).
+  # Stale bindings from prior installs keep pointing to the old cert even after IIS site removal.
+  netsh http delete sslcert hostnameport="localhost:$httpsPort"   2>$null | Out-Null
+  netsh http delete sslcert hostnameport="127.0.0.1:$httpsPort"  2>$null | Out-Null
+  if ($domain -and $domain -ne "localhost") {
+    netsh http delete sslcert hostnameport="${domain}:$httpsPort" 2>$null | Out-Null
+  }
+  netsh http delete sslcert ipport="0.0.0.0:$httpsPort"          2>$null | Out-Null
+  netsh http delete sslcert ipport="127.0.0.1:$httpsPort"        2>$null | Out-Null
+  if ($lanIp) { netsh http delete sslcert ipport="${lanIp}:${httpsPort}" 2>$null | Out-Null }
+
   # Build SAN: always include localhost + 127.0.0.1, plus domain and LAN IP if present
   $sanExt = "2.5.29.17={text}DNS=localhost&IPAddress=127.0.0.1"
   if ($domain -and $domain -ne "localhost") { $sanExt += "&DNS=$domain" }
@@ -884,19 +900,16 @@ function Ensure-IISProxyMode([string]$domain,[string]$siteRoot,[string]$certPath
   if (Test-Path "IIS:\Sites\LocalS3-IIS") {
     Remove-Website -Name "LocalS3-IIS"
   }
-  New-Website -Name "LocalS3-IIS" -PhysicalPath $siteRoot -Port 80 -IPAddress "*" -HostHeader $domain | Out-Null
-  New-WebBinding -Name "LocalS3-IIS" -Protocol "https" -Port $httpsPort -IPAddress "*" -HostHeader $domain -SslFlags 1 | Out-Null
-  (Get-WebBinding -Name "LocalS3-IIS" -Protocol https -Port $httpsPort -HostHeader $domain).AddSslCertificate($thumb,"My")
-
-  # Add direct LAN-IP binding so https://<LAN-IP> works from other computers.
+  New-Website -Name "LocalS3-IIS" -PhysicalPath $siteRoot -Port 80 -Force | Out-Null
+  # Use non-SNI binding (SslFlags=0, no HostHeader) so HTTP.SYS uses ipport netsh entries.
+  # SNI (SslFlags=1) relies on hostnameport entries that can silently fail to update across reinstalls.
+  New-WebBinding -Name "LocalS3-IIS" -Protocol "https" -Port $httpsPort -IPAddress "*" -HostHeader "" -SslFlags 0 | Out-Null
+  $appId = "{$(New-Guid)}"
+  # Bind cert explicitly via netsh — more reliable than AddSslCertificate across reinstalls
+  netsh http add sslcert ipport="0.0.0.0:$httpsPort" certhash=$thumb appid=$appId certstorename=MY 2>&1 | Out-Null
   if ($lanIp) {
-    $ipBindingInfo = "$lanIp`:$httpsPort`:"
-    $ipBinding = Get-WebBinding -Name "LocalS3-IIS" -Protocol https | Where-Object { $_.bindingInformation -eq $ipBindingInfo }
-    if (-not $ipBinding) {
-      New-WebBinding -Name "LocalS3-IIS" -Protocol "https" -Port $httpsPort -IPAddress $lanIp -HostHeader "" -SslFlags 0 | Out-Null
-      $ipBinding = Get-WebBinding -Name "LocalS3-IIS" -Protocol https | Where-Object { $_.bindingInformation -eq $ipBindingInfo } | Select-Object -First 1
-      if ($ipBinding) { $ipBinding.AddSslCertificate($thumb,"My") }
-    }
+    New-WebBinding -Name "LocalS3-IIS" -Protocol "https" -Port $httpsPort -IPAddress $lanIp -HostHeader "" -SslFlags 0 | Out-Null
+    netsh http add sslcert ipport="${lanIp}:${httpsPort}" certhash=$thumb appid=$appId certstorename=MY 2>&1 | Out-Null
   }
 
   $ErrorActionPreference = "Continue"
@@ -1462,11 +1475,16 @@ function Remove-ExistingLocalS3IISInstall([string]$root, [switch]$DeleteData) {
 
   try {
     Import-Module WebAdministration -ErrorAction SilentlyContinue
-    if (Test-Path "IIS:\Sites\LocalS3-IIS") {
-      Stop-Website -Name "LocalS3-IIS" 2>$null | Out-Null
-      Remove-Website -Name "LocalS3-IIS" 2>$null | Out-Null
+    foreach ($siteName in @("LocalS3-IIS", "LocalS3-Console")) {
+      if (Test-Path "IIS:\Sites\$siteName") {
+        Stop-Website -Name $siteName 2>$null | Out-Null
+        Remove-Website -Name $siteName 2>$null | Out-Null
+      }
     }
   } catch {}
+  # Remove old LocalS3 certs from cert store so reinstalls don't inherit stale non-CA certs
+  Get-ChildItem Cert:\LocalMachine\My   | Where-Object { $_.FriendlyName -eq "LocalS3-HTTPS" } | Remove-Item -Force -ErrorAction SilentlyContinue
+  Get-ChildItem Cert:\LocalMachine\Root | Where-Object { $_.FriendlyName -eq "LocalS3-HTTPS" } | Remove-Item -Force -ErrorAction SilentlyContinue
 
   schtasks /End /TN "LocalS3-MinIO" 1>$null 2>$null | Out-Null
   schtasks /Delete /TN "LocalS3-MinIO" /F 1>$null 2>$null | Out-Null
