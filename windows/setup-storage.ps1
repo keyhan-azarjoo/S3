@@ -844,11 +844,17 @@ function Ensure-IISProxyMode([string]$domain,[string]$siteRoot,[string]$certPath
     Warn "Could not update IIS Rewrite allowed server variables automatically. If proxy requests fail, allow HTTP_X_FORWARDED_PROTO/HOST/FOR in IIS Rewrite settings."
   }
 
-  # Remove ALL old LocalS3 certs from both stores before generating new ones.
-  # This prevents Go (MinIO) from finding an old non-CA cert in the Root store and failing
-  # with "parent certificate cannot sign this kind of certificate".
-  Get-ChildItem Cert:\LocalMachine\My   | Where-Object { $_.FriendlyName -eq "LocalS3-HTTPS" } | Remove-Item -Force -ErrorAction SilentlyContinue
-  Get-ChildItem Cert:\LocalMachine\Root | Where-Object { $_.FriendlyName -eq "LocalS3-HTTPS" } | Remove-Item -Force -ErrorAction SilentlyContinue
+  # Remove legacy LocalS3 certs before generating a fresh trust chain.
+  # Older versions stored a self-signed localhost leaf in Root, which can cause Go to
+  # pick the wrong authority and fail with "crypto/rsa: verification error".
+  Get-ChildItem Cert:\LocalMachine\My | Where-Object {
+    $_.FriendlyName -in @("LocalS3-HTTPS","LocalS3 HTTPS","LocalS3 Root CA") -or
+    ($_.Subject -eq "CN=localhost" -and $_.Issuer -eq $_.Subject)
+  } | Remove-Item -Force -ErrorAction SilentlyContinue
+  Get-ChildItem Cert:\LocalMachine\Root | Where-Object {
+    $_.FriendlyName -in @("LocalS3-HTTPS","LocalS3 HTTPS","LocalS3 Root CA") -or
+    ($_.Subject -eq "CN=localhost" -and $_.Issuer -eq $_.Subject)
+  } | Remove-Item -Force -ErrorAction SilentlyContinue
   # Clean up ALL netsh SSL bindings for this port (both SNI hostnameport and non-SNI ipport).
   # Stale bindings from prior installs keep pointing to the old cert even after IIS site removal.
   netsh http delete sslcert hostnameport="localhost:$httpsPort"   2>$null | Out-Null
@@ -873,45 +879,52 @@ function Ensure-IISProxyMode([string]$domain,[string]$siteRoot,[string]$certPath
   if ($domain -and $domain -ne "localhost") { $sanExt += "&DNS=$domain" }
   if ($lanIp) { $sanExt += "&IPAddress=$lanIp" }
 
+  $rootCa = $null
   $cert = $null
-  # BasicConstraints CA=true required so Go/OpenSSL trust the self-signed cert as a root CA
-  $bcExt = "2.5.29.19={critical}{text}ca=true"
+  $rootPath = Join-Path $env:TEMP "locals3-root-ca.cer"
+  $rootBcExt = "2.5.29.19={critical}{text}ca=true&pathlength=1"
+  $leafBcExt = "2.5.29.19={critical}{text}ca=false"
+  $serverAuthExt = "2.5.29.37={text}1.3.6.1.5.5.7.3.1"
 
-  # Method 1: New-SelfSignedCertificate with CA flags + IP SAN
   try {
-    $cert = New-SelfSignedCertificate -Subject "CN=localhost" -TextExtension @($sanExt, $bcExt) `
-      -KeyAlgorithm RSA -KeyLength 2048 -FriendlyName "LocalS3-HTTPS" `
-      -KeyUsage CertSign, CRLSign, DigitalSignature, KeyEncipherment `
-      -CertStoreLocation "Cert:\LocalMachine\My" -NotAfter (Get-Date).AddYears(3)
-    if ($cert) { $Script:IISCertIncludesIpSan = $true; Info "Cert generated with IP SAN and CA flags." }
+    $rootCa = New-SelfSignedCertificate -Subject "CN=LocalS3 Root CA" `
+      -FriendlyName "LocalS3 Root CA" `
+      -KeyAlgorithm RSA -KeyLength 2048 -HashAlgorithm SHA256 `
+      -KeyExportPolicy Exportable `
+      -KeyUsage CertSign, CRLSign, DigitalSignature `
+      -TextExtension @($rootBcExt) `
+      -CertStoreLocation "Cert:\LocalMachine\My" `
+      -NotAfter (Get-Date).AddYears(5)
+    if (-not $rootCa) { throw "Root CA certificate was not created." }
+
+    $rootExport = Export-Certificate -Cert "Cert:\LocalMachine\My\$($rootCa.Thumbprint)" -FilePath $rootPath -Force
+    Import-Certificate -FilePath $rootExport.FullName -CertStoreLocation "Cert:\LocalMachine\Root" | Out-Null
+
+    $leafExtensions = @($sanExt, $leafBcExt, $serverAuthExt)
+    $cert = New-SelfSignedCertificate -Subject "CN=localhost" `
+      -FriendlyName "LocalS3 HTTPS" `
+      -Signer $rootCa `
+      -KeyAlgorithm RSA -KeyLength 2048 -HashAlgorithm SHA256 `
+      -KeyExportPolicy Exportable `
+      -KeyUsage DigitalSignature, KeyEncipherment `
+      -TextExtension $leafExtensions `
+      -CertStoreLocation "Cert:\LocalMachine\My" `
+      -NotAfter (Get-Date).AddYears(3)
+    if (-not $cert) { throw "Leaf certificate was not created." }
+
+    $Script:IISCertIncludesIpSan = $true
+    Info "Generated LocalS3 root CA and server certificate."
   } catch {
-    Warn "New-SelfSignedCertificate with IP SAN failed: $($_.Exception.Message)"
+    Err "Failed to generate IIS HTTPS certificates: $($_.Exception.Message)"
+    Warn "Open certlm.msc and remove old 'LocalS3 Root CA' / 'localhost' certificates if this keeps failing."
+    exit 1
+  } finally {
+    Remove-Item -Path $rootPath -Force -ErrorAction SilentlyContinue
   }
-  # Method 2: certreq.exe fallback — works on all Windows versions
-  if (-not $cert) {
-    try {
-      $infPath = Join-Path $env:TEMP "locals3-cert.inf"
-      $sanLines = "_continue_ = `"dns=localhost&`"`r`n_continue_ = `"ipaddress=127.0.0.1&`""
-      if ($domain -and $domain -ne "localhost") { $sanLines += "`r`n_continue_ = `"dns=$domain&`"" }
-      if ($lanIp) { $sanLines += "`r`n_continue_ = `"ipaddress=$lanIp&`"" }
-      $infContent = "[Version]`r`nSignature=`"`$Windows NT`$`"`r`n[NewRequest]`r`nSubject=`"CN=localhost`"`r`nKeyLength=2048`r`nKeyAlgorithm=RSA`r`nMachineKeySet=True`r`nRequestType=Cert`r`nValidityPeriod=Years`r`nValidityPeriodUnits=3`r`nKeySpec=AT_SIGNATURE`r`n[Extensions]`r`n2.5.29.17 = `"{text}`"`r`n$sanLines`r`n2.5.29.19 = `"{critical}{text}ca=true`""
-      [System.IO.File]::WriteAllText($infPath, $infContent)
-      certreq -new -machine $infPath "$env:TEMP\locals3-cert.cer" 2>&1 | Out-Null
-      $cert = Get-ChildItem Cert:\LocalMachine\My | Where-Object { $_.Subject -eq "CN=localhost" } | Sort-Object NotBefore -Descending | Select-Object -First 1
-      if ($cert) { $Script:IISCertIncludesIpSan = $true; Info "Cert generated with IP SAN and CA flags via certreq." }
-    } catch { Warn "certreq cert generation failed: $($_.Exception.Message)" }
-  }
-  # Final fallback: DNS-only cert with CA flags
-  if (-not $cert) {
-    Warn "Falling back to DNS-only cert. LAN-IP HTTPS URLs will show a certificate warning."
-    $cert = New-SelfSignedCertificate -Subject "CN=localhost" -TextExtension @($bcExt) `
-      -KeyAlgorithm RSA -KeyLength 2048 -FriendlyName "LocalS3-HTTPS" `
-      -KeyUsage CertSign, CRLSign, DigitalSignature, KeyEncipherment `
-      -CertStoreLocation "Cert:\LocalMachine\My" -NotAfter (Get-Date).AddYears(3)
-  }
+
   $thumb = $cert.Thumbprint
   $Script:IISCertThumb = $thumb
-  Import-Certificate -FilePath (Export-Certificate -Cert "Cert:\LocalMachine\My\$thumb" -FilePath $certPath -Force).FullName -CertStoreLocation "Cert:\LocalMachine\Root" | Out-Null
+  Export-Certificate -Cert "Cert:\LocalMachine\My\$thumb" -FilePath $certPath -Force | Out-Null
 
   foreach ($legacySite in @("LocalS3", "LocalS3-IIS", "LocalS3-Console")) {
     if (Test-Path "IIS:\Sites\$legacySite") {
@@ -1479,9 +1492,15 @@ function Remove-ExistingLocalS3IISInstall([string]$root, [switch]$DeleteData) {
       }
     }
   } catch {}
-  # Remove old LocalS3 certs from cert store so reinstalls don't inherit stale non-CA certs
-  Get-ChildItem Cert:\LocalMachine\My   | Where-Object { $_.FriendlyName -eq "LocalS3-HTTPS" } | Remove-Item -Force -ErrorAction SilentlyContinue
-  Get-ChildItem Cert:\LocalMachine\Root | Where-Object { $_.FriendlyName -eq "LocalS3-HTTPS" } | Remove-Item -Force -ErrorAction SilentlyContinue
+  # Remove LocalS3 certs from cert store so reinstalls don't inherit stale or mismatched chains.
+  Get-ChildItem Cert:\LocalMachine\My | Where-Object {
+    $_.FriendlyName -in @("LocalS3-HTTPS","LocalS3 HTTPS","LocalS3 Root CA") -or
+    ($_.Subject -eq "CN=localhost" -and $_.Issuer -eq $_.Subject)
+  } | Remove-Item -Force -ErrorAction SilentlyContinue
+  Get-ChildItem Cert:\LocalMachine\Root | Where-Object {
+    $_.FriendlyName -in @("LocalS3-HTTPS","LocalS3 HTTPS","LocalS3 Root CA") -or
+    ($_.Subject -eq "CN=localhost" -and $_.Issuer -eq $_.Subject)
+  } | Remove-Item -Force -ErrorAction SilentlyContinue
 
   schtasks /End /TN "LocalS3-MinIO" 1>$null 2>$null | Out-Null
   schtasks /Delete /TN "LocalS3-MinIO" /F 1>$null 2>$null | Out-Null
