@@ -567,6 +567,7 @@ function Ensure-IISInstalled {
 function Ensure-MinIONative([string]$root,[int]$apiPort,[int]$uiPort,[string]$publicUrl,[string]$consoleBrowserUrl="") {
   $Script:ActiveAccessKey = "admin"
   $Script:ActiveSecretKey = "StrongPassword123"
+  $preferredMinIORelease = "RELEASE.2025-04-22T22-12-26Z"
   $binDir = Join-Path $root "minio"
   $dataDir = Join-Path $root "data"
   $configDir = Join-Path $root "config"
@@ -592,15 +593,15 @@ function Ensure-MinIONative([string]$root,[int]$apiPort,[int]$uiPort,[string]$pu
   }
   $ErrorActionPreference = $prev
 
-  # Prefer the current official MinIO build first so the Console UI exposes the latest
-  # access-management and admin features. Use older pinned releases only as fallback.
+  # Pin to the last release before the May 24, 2025 Console change so the web UI keeps
+  # the fuller access-management/admin experience the user expects.
   $minioUrls = @(
-    "https://dl.min.io/server/minio/release/windows-amd64/minio.exe",
-    "https://github.com/minio/minio/releases/latest/download/minio.exe"
-    "https://dl.min.io/server/minio/release/windows-amd64/archive/minio.RELEASE.2025-04-22T22-12-26Z",
+    "https://dl.min.io/server/minio/release/windows-amd64/archive/minio.$preferredMinIORelease",
     "https://dl.min.io/server/minio/release/windows-amd64/archive/minio.RELEASE.2025-01-18T00-31-37Z",
     "https://dl.min.io/server/minio/release/windows-amd64/archive/minio.RELEASE.2023-10-16T04-13-43Z",
-    "https://dl.min.io/server/minio/release/windows-amd64/archive/minio.RELEASE.2023-07-21T21-12-44Z"
+    "https://dl.min.io/server/minio/release/windows-amd64/archive/minio.RELEASE.2023-07-21T21-12-44Z",
+    "https://dl.min.io/server/minio/release/windows-amd64/minio.exe",
+    "https://github.com/minio/minio/releases/latest/download/minio.exe"
   )
   $downloaded = $false
   $lastDownloadError = ""
@@ -1625,7 +1626,7 @@ function Trust-LocalTlsCert([string]$certPath) {
   }
 }
 
-function Start-ContainersFallback([string]$dockerCtx, [string]$ngconf, [string]$ngcerts, [string]$minioVolume, [int]$consoleHttpsPort, [int]$apiHttpsPort, [int]$minioApi, [int]$minioUI, [string]$consoleProxyUrl) {
+function Start-ContainersFallback([string]$dockerCtx, [string]$ngconf, [string]$ngcerts, [string]$minioVolume, [string]$minioImage, [int]$consoleHttpsPort, [int]$apiHttpsPort, [int]$minioApi, [int]$minioUI, [string]$consoleProxyUrl) {
   Warn "Falling back to direct 'docker run' startup (compose unavailable in this environment)."
   $network = "storage-net"
 
@@ -1646,7 +1647,7 @@ function Start-ContainersFallback([string]$dockerCtx, [string]$ngconf, [string]$
     -p "${minioApi}:9000" `
     -p "${minioUI}:9001" `
     -v "${minioVolume}:/data" `
-    minio/minio server /data --console-address ":9001" | Out-Null
+    $minioImage server /data --console-address ":9001" | Out-Null
   $minioExit = $LASTEXITCODE
   if ($minioExit -ne 0) {
     $ErrorActionPreference = $prev
@@ -1678,6 +1679,7 @@ function Write-FilesAndUp {
   $ngcerts = Join-Path $project "nginx\certs"
   $data   = Join-Path $project "data"
   $minioVolume = "locals3-minio-data"
+  $minioImage = "minio/minio:RELEASE.2025-04-22T22-12-26Z"
 
   $domainInput = Read-Host "Enter local domain/URL for HTTPS (default: localhost)"
   $domain = Normalize-HostInput $domainInput
@@ -1756,7 +1758,7 @@ function Write-FilesAndUp {
   $compose = @"
 services:
   minio:
-    image: minio/minio
+    image: $minioImage
     container_name: minio
     labels:
       - "com.locals3.installer=true"
@@ -1924,7 +1926,7 @@ server {
     if ($composeText -match "invalid proto:") {
       Warn "Detected compose transport error ('invalid proto:')."
       Pop-Location
-      Start-ContainersFallback -dockerCtx $dockerCtx -ngconf $ngconf -ngcerts $ngcerts -minioVolume $minioVolume -consoleHttpsPort $nginxHttps -apiHttpsPort $apiHttps -minioApi $minioApi -minioUI $minioUI -consoleProxyUrl $consoleProxyUrl
+      Start-ContainersFallback -dockerCtx $dockerCtx -ngconf $ngconf -ngcerts $ngcerts -minioVolume $minioVolume -minioImage $minioImage -consoleHttpsPort $nginxHttps -apiHttpsPort $apiHttps -minioApi $minioApi -minioUI $minioUI -consoleProxyUrl $consoleProxyUrl
       $usedFallback = $true
     } else {
       Warn "Showing compose logs..."
