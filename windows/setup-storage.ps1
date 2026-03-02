@@ -564,7 +564,7 @@ function Ensure-IISInstalled {
   Info "IIS prerequisites installed successfully."
 }
 
-function Ensure-MinIONative([string]$root,[int]$apiPort,[int]$uiPort,[string]$publicUrl,[string]$consoleBrowserUrl="",[string]$serverUrlOverride="") {
+function Ensure-MinIONative([string]$root,[int]$apiPort,[int]$uiPort,[string]$publicUrl,[string]$consoleBrowserUrl="") {
   $Script:ActiveAccessKey = "admin"
   $Script:ActiveSecretKey = "StrongPassword123"
   $binDir = Join-Path $root "minio"
@@ -663,11 +663,9 @@ function Ensure-MinIONative([string]$root,[int]$apiPort,[int]$uiPort,[string]$pu
     if ($ver) { Info "Using MinIO binary: $ver" }
   } catch {}
 
-  $effectiveServerUrl = if ([string]::IsNullOrWhiteSpace($serverUrlOverride)) { $publicUrl } else { $serverUrlOverride }
-
   $runnerBody = @"
 @echo off
-set MINIO_SERVER_URL=$effectiveServerUrl
+set MINIO_SERVER_URL=$publicUrl
 set MINIO_BROWSER_REDIRECT_URL=$consoleBrowserUrl
 set MINIO_CONSOLE_REDIRECT_URL=
 set MINIO_ROOT_USER=admin
@@ -1055,10 +1053,9 @@ function Install-IISMode {
   $publicUrl = if ($httpsPort -eq 443) { "https://$domain" } else { "https://${domain}:$httpsPort" }
   # Keep the console on the chosen host name for a cleaner, consistent login URL.
   $consoleBrowserUrl = if ($consoleHttpsPort -eq 443) { "https://$domain" } else { "https://${domain}:$consoleHttpsPort" }
-  $internalServerUrl = "http://127.0.0.1:$apiPort"
 
   Ensure-IISInstalled
-  Ensure-MinIONative -root $root -apiPort $apiPort -uiPort $uiPort -publicUrl $publicUrl -consoleBrowserUrl $consoleBrowserUrl -serverUrlOverride $internalServerUrl
+  Ensure-MinIONative -root $root -apiPort $apiPort -uiPort $uiPort -publicUrl $publicUrl -consoleBrowserUrl $consoleBrowserUrl
   $crt = Join-Path $certDir "localhost.crt"
   $key = Join-Path $certDir "localhost.key"
   Ensure-IISProxyMode -domain $domain -siteRoot $siteRoot -certPath $crt -keyPath $key -httpsPort $httpsPort -targetPort $apiPort -consoleHttpsPort $consoleHttpsPort -uiPort $uiPort -lanIp $lanIp
