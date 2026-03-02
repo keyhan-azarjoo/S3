@@ -574,6 +574,24 @@ function Ensure-MinIONative([string]$root,[int]$apiPort,[int]$uiPort,[string]$pu
   $runner = Join-Path $binDir "run-minio.cmd"
   $logFile = Join-Path $binDir "minio.log"
   New-Item -ItemType Directory -Force -Path $binDir,$dataDir,$configDir | Out-Null
+
+  # ---- Stop any previously running MinIO so the file lock is released ----
+  $prev = $ErrorActionPreference
+  $ErrorActionPreference = "Continue"
+  schtasks /Query /TN "LocalS3-MinIO" 1>$null 2>$null
+  if ($LASTEXITCODE -eq 0) {
+    Info "Stopping existing MinIO scheduled task before update..."
+    schtasks /End /TN "LocalS3-MinIO" 1>$null 2>$null | Out-Null
+    Start-Sleep -Seconds 2
+  }
+  $minioProc = Get-Process -Name "minio" -ErrorAction SilentlyContinue
+  if ($minioProc) {
+    Info "Terminating running minio.exe process(es)..."
+    $minioProc | Stop-Process -Force -ErrorAction SilentlyContinue
+    Start-Sleep -Seconds 3
+  }
+  $ErrorActionPreference = $prev
+
   # Use a pinned stable release first (deterministic), then fallback to latest.
   $minioUrls = @(
     "https://dl.min.io/server/minio/release/windows-amd64/archive/minio.RELEASE.2023-07-21T21-12-44Z",
@@ -762,7 +780,6 @@ function Ensure-IISProxyMode([string]$domain,[string]$siteRoot,[string]$certPath
 <?xml version="1.0" encoding="utf-8"?>
 <configuration>
   <system.webServer>
-    <webSocket enabled="true" />
     <security>
       <requestFiltering>
         <requestLimits maxAllowedContentLength="4294967295" />
