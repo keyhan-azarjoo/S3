@@ -592,14 +592,15 @@ function Ensure-MinIONative([string]$root,[int]$apiPort,[int]$uiPort,[string]$pu
   }
   $ErrorActionPreference = $prev
 
-  # Use a pinned stable release first (deterministic), then fallback to latest.
+  # Prefer the current official MinIO build first so the Console UI exposes the latest
+  # access-management and admin features. Use older pinned releases only as fallback.
   $minioUrls = @(
-    "https://dl.min.io/server/minio/release/windows-amd64/archive/minio.RELEASE.2023-07-21T21-12-44Z",
-    "https://dl.min.io/server/minio/release/windows-amd64/archive/minio.RELEASE.2023-10-16T04-13-43Z",
-    "https://dl.min.io/server/minio/release/windows-amd64/archive/minio.RELEASE.2025-04-22T22-12-26Z",
-    "https://dl.min.io/server/minio/release/windows-amd64/archive/minio.RELEASE.2025-01-18T00-31-37Z",
     "https://dl.min.io/server/minio/release/windows-amd64/minio.exe",
     "https://github.com/minio/minio/releases/latest/download/minio.exe"
+    "https://dl.min.io/server/minio/release/windows-amd64/archive/minio.RELEASE.2025-04-22T22-12-26Z",
+    "https://dl.min.io/server/minio/release/windows-amd64/archive/minio.RELEASE.2025-01-18T00-31-37Z",
+    "https://dl.min.io/server/minio/release/windows-amd64/archive/minio.RELEASE.2023-10-16T04-13-43Z",
+    "https://dl.min.io/server/minio/release/windows-amd64/archive/minio.RELEASE.2023-07-21T21-12-44Z"
   )
   $downloaded = $false
   $lastDownloadError = ""
