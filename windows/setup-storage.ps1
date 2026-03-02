@@ -842,12 +842,16 @@ function Ensure-IISProxyMode([string]$domain,[string]$siteRoot,[string]$certPath
   if ($lanIp) { $sanExt += "&IPAddress=$lanIp" }
 
   $cert = $null
-  # Method 1: New-SelfSignedCertificate with -Subject (no -DnsName) avoids TextExtension conflicts
+  # BasicConstraints CA=true required so Go/OpenSSL trust the self-signed cert as a root CA
+  $bcExt = "2.5.29.19={critical}{text}ca=true"
+
+  # Method 1: New-SelfSignedCertificate with CA flags + IP SAN
   try {
-    $cert = New-SelfSignedCertificate -Subject "CN=localhost" -TextExtension @($sanExt) `
+    $cert = New-SelfSignedCertificate -Subject "CN=localhost" -TextExtension @($sanExt, $bcExt) `
       -KeyAlgorithm RSA -KeyLength 2048 -FriendlyName "LocalS3-HTTPS" `
+      -KeyUsage CertSign, CRLSign, DigitalSignature, KeyEncipherment `
       -CertStoreLocation "Cert:\LocalMachine\My" -NotAfter (Get-Date).AddYears(3)
-    if ($cert) { $Script:IISCertIncludesIpSan = $true; Info "Cert generated with IP SAN." }
+    if ($cert) { $Script:IISCertIncludesIpSan = $true; Info "Cert generated with IP SAN and CA flags." }
   } catch {
     Warn "New-SelfSignedCertificate with IP SAN failed: $($_.Exception.Message)"
   }
@@ -858,17 +862,19 @@ function Ensure-IISProxyMode([string]$domain,[string]$siteRoot,[string]$certPath
       $sanLines = "_continue_ = `"dns=localhost&`"`r`n_continue_ = `"ipaddress=127.0.0.1&`""
       if ($domain -and $domain -ne "localhost") { $sanLines += "`r`n_continue_ = `"dns=$domain&`"" }
       if ($lanIp) { $sanLines += "`r`n_continue_ = `"ipaddress=$lanIp&`"" }
-      $infContent = "[Version]`r`nSignature=`"`$Windows NT`$`"`r`n[NewRequest]`r`nSubject=`"CN=localhost`"`r`nKeyLength=2048`r`nKeyAlgorithm=RSA`r`nMachineKeySet=True`r`nRequestType=Cert`r`nValidityPeriod=Years`r`nValidityPeriodUnits=3`r`n[Extensions]`r`n2.5.29.17 = `"{text}`"`r`n$sanLines"
+      $infContent = "[Version]`r`nSignature=`"`$Windows NT`$`"`r`n[NewRequest]`r`nSubject=`"CN=localhost`"`r`nKeyLength=2048`r`nKeyAlgorithm=RSA`r`nMachineKeySet=True`r`nRequestType=Cert`r`nValidityPeriod=Years`r`nValidityPeriodUnits=3`r`nKeySpec=AT_SIGNATURE`r`n[Extensions]`r`n2.5.29.17 = `"{text}`"`r`n$sanLines`r`n2.5.29.19 = `"{critical}{text}ca=true`""
       [System.IO.File]::WriteAllText($infPath, $infContent)
       certreq -new -machine $infPath "$env:TEMP\locals3-cert.cer" 2>&1 | Out-Null
       $cert = Get-ChildItem Cert:\LocalMachine\My | Where-Object { $_.Subject -eq "CN=localhost" } | Sort-Object NotBefore -Descending | Select-Object -First 1
-      if ($cert) { $Script:IISCertIncludesIpSan = $true; Info "Cert generated with IP SAN via certreq." }
+      if ($cert) { $Script:IISCertIncludesIpSan = $true; Info "Cert generated with IP SAN and CA flags via certreq." }
     } catch { Warn "certreq cert generation failed: $($_.Exception.Message)" }
   }
-  # Final fallback: DNS-only cert
+  # Final fallback: DNS-only cert with CA flags
   if (-not $cert) {
     Warn "Falling back to DNS-only cert. LAN-IP HTTPS URLs will show a certificate warning."
-    $cert = New-SelfSignedCertificate -DnsName @("localhost",$domain | Select-Object -Unique) `
+    $cert = New-SelfSignedCertificate -Subject "CN=localhost" -TextExtension @($bcExt) `
+      -KeyAlgorithm RSA -KeyLength 2048 -FriendlyName "LocalS3-HTTPS" `
+      -KeyUsage CertSign, CRLSign, DigitalSignature, KeyEncipherment `
       -CertStoreLocation "Cert:\LocalMachine\My" -NotAfter (Get-Date).AddYears(3)
   }
   $thumb = $cert.Thumbprint
