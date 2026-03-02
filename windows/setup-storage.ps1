@@ -1015,7 +1015,9 @@ function Install-IISMode {
     $uiPort = Resolve-RequiredPort -label "MinIO Console UI" -candidates @() -defaultPort ($apiPort + 1)
   }
   # Console HTTPS proxy port: try httpsPort+1000 range (e.g. 8443→9443)
-  $consoleHttpsPort = Resolve-RequiredPort -label "MinIO Console HTTPS" -candidates @(9443,10443,11443,12443,13443) -defaultPort ($httpsPort + 1000)
+  # Exclude $httpsPort from candidates to prevent the API site and console site from both resolving to the same port.
+  $consoleCandidates = @(9443,10443,11443,12443,13443) | Where-Object { $_ -ne $httpsPort }
+  $consoleHttpsPort = Resolve-RequiredPort -label "MinIO Console HTTPS" -candidates $consoleCandidates -defaultPort ($httpsPort + 1000)
 
   Run-PreflightChecks -DataPath $root
 
