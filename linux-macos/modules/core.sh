@@ -76,6 +76,56 @@ pick_port() {
   echo ""
 }
 
+resolve_https_port_unix() {
+  local choice custom_port picked
+
+  if port_free 443; then
+    read -r -p "Use HTTPS port 443? (Y/n): " choice
+    choice="$(echo "${choice:-y}" | tr '[:upper:]' '[:lower:]')"
+    if [ "$choice" = "y" ] || [ "$choice" = "yes" ]; then
+      echo "443"
+      return
+    fi
+  else
+    warn "Port 443 is busy."
+  fi
+
+  echo "Choose HTTPS port option:"
+  echo "  1) Auto alternate port (tries: 8443, 9443, 10443)"
+  echo "  2) Enter custom port"
+  read -r -p "Select option [1/2] (default: 1): " choice
+
+  if [ "${choice:-1}" = "2" ]; then
+    while true; do
+      read -r -p "Enter custom HTTPS port (1-65535, default: 8443): " custom_port
+      custom_port="${custom_port:-8443}"
+      if ! echo "$custom_port" | grep -Eq '^[0-9]+$'; then
+        warn "Invalid port number: $custom_port"
+        continue
+      fi
+      if [ "$custom_port" -lt 1 ] || [ "$custom_port" -gt 65535 ]; then
+        warn "Port must be between 1 and 65535."
+        continue
+      fi
+      if ! port_free "$custom_port"; then
+        warn "Port $custom_port is already in use."
+        continue
+      fi
+      echo "$custom_port"
+      return
+    done
+  fi
+
+  picked="$(pick_port 8443 9443 10443)"
+  if [ -n "$picked" ]; then
+    echo "$picked"
+    return
+  fi
+
+  err "No free HTTPS port was found in the default range (8443, 9443, 10443)."
+  exit 1
+}
+
 get_lan_ipv4() {
   local os ip=""
   os="$(detect_os)"
@@ -373,12 +423,9 @@ main() {
     lan_ip="$(get_lan_ipv4)"
   fi
 
-  https_port=443
-  if ! port_free 443; then
-    warn "Port 443 is busy."
-    https_port="$(pick_port 8443 9443 10443)"
-    [ -z "$https_port" ] && { err "No free HTTPS port."; exit 1; }
-    warn "Using alternate HTTPS port: $https_port"
+  https_port="$(resolve_https_port_unix)"
+  if [ "$https_port" != "443" ]; then
+    warn "Using HTTPS port: $https_port"
   fi
   api_port="$(pick_port 9000 19000 29000)"
   ui_port="$(pick_port 9001 19001 29001)"
