@@ -486,8 +486,8 @@ function Resolve-InstallHost([string]$prompt) {
   if ($domain -eq "localhost") {
     $publicIp = Get-PublicIPv4
     if ($publicIp) {
-      $usePublicIp = (Read-Host "Detected public/static IP $publicIp. Use it instead of localhost? (y/N)").Trim().ToLowerInvariant()
-      if ($usePublicIp -eq "y" -or $usePublicIp -eq "yes") {
+      $usePublicIp = (Read-Host "Detected public/static IP $publicIp. Use it instead of localhost? (Y/n)").Trim().ToLowerInvariant()
+      if ([string]::IsNullOrWhiteSpace($usePublicIp) -or $usePublicIp -eq "y" -or $usePublicIp -eq "yes") {
         $domain = $publicIp
       }
     }

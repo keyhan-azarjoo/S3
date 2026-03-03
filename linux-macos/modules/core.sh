@@ -407,8 +407,8 @@ main() {
   if [ "$domain" = "localhost" ]; then
     public_ip="$(get_public_ipv4)"
     if [ -n "$public_ip" ]; then
-      read -r -p "Detected public/static IP ${public_ip}. Use it instead of localhost? (y/N): " use_public_ip
-      use_public_ip="$(echo "${use_public_ip:-n}" | tr '[:upper:]' '[:lower:]')"
+      read -r -p "Detected public/static IP ${public_ip}. Use it instead of localhost? (Y/n): " use_public_ip
+      use_public_ip="$(echo "${use_public_ip:-y}" | tr '[:upper:]' '[:lower:]')"
       if [ "$use_public_ip" = "y" ] || [ "$use_public_ip" = "yes" ]; then
         domain="$public_ip"
       fi
