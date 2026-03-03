@@ -285,6 +285,9 @@ function Start-ContainersFallback([string]$dockerCtx, [string]$ngconf, [string]$
     "--network", $network,
     "-e", "MINIO_ROOT_USER=admin",
     "-e", "MINIO_ROOT_PASSWORD=StrongPassword123",
+    "-e", "MINIO_API_PORT=9000",
+    "-e", "MINIO_CONSOLE_PORT=9001",
+    "-e", "MINIO_ADMIN_CONSOLE_PORT=9002",
     "-e", "MINIO_BROWSER_REDIRECT_URL=$consoleBrowserUrl",
     "-e", "MINIO_BROWSER_SESSION_DURATION=$browserSessionDuration",
     "-p", "${minioApi}:9000",
@@ -328,7 +331,7 @@ function Write-FilesAndUp {
   $ngcerts = Join-Path $project "nginx\certs"
   $data = Join-Path $project "data"
   $minioVolume = "locals3-minio-data"
-  $minioImage = "minio/minio:latest"
+  $minioImage = "firstfinger/minio:latest-amd64"
 
   $domainInput = Read-Host "Enter local domain/URL for HTTPS (default: localhost)"
   $domain = Normalize-HostInput $domainInput
@@ -404,6 +407,9 @@ services:
     environment:
       MINIO_ROOT_USER: admin
       MINIO_ROOT_PASSWORD: StrongPassword123
+      MINIO_API_PORT: "9000"
+      MINIO_CONSOLE_PORT: "9001"
+      MINIO_ADMIN_CONSOLE_PORT: "9002"
       MINIO_PROMETHEUS_AUTH_TYPE: public
       MINIO_BROWSER_REDIRECT_URL: "$consoleRedirectUrl"
       MINIO_BROWSER_SESSION_DURATION: "$browserSessionDuration"
@@ -507,7 +513,7 @@ server {
     client_max_body_size 5g;
 
     location / {
-        proxy_pass         http://minio:9001;
+        proxy_pass         http://minio:9002;
         proxy_http_version 1.1;
         proxy_set_header Host            `$http_host;
         proxy_set_header X-Real-IP       `$remote_addr;
