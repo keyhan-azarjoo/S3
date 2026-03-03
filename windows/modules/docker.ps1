@@ -293,8 +293,7 @@ function Start-ContainersFallback([string]$dockerCtx, [string]$ngconf, [string]$
     "-p", "${minioApi}:9000",
     "-p", "${minioUI}:9001",
     "-v", "${minioVolume}:/data",
-    $minioImage,
-    "server", "/data", "--console-address", ":9001"
+    $minioImage
   )
   docker @minioArgs | Out-Null
   $minioExit = $LASTEXITCODE
@@ -403,7 +402,6 @@ services:
     labels:
       - "com.locals3.installer=true"
       - "com.locals3.role=minio"
-    command: server /data --console-address ":9001"
     environment:
       MINIO_ROOT_USER: admin
       MINIO_ROOT_PASSWORD: StrongPassword123
