@@ -70,7 +70,7 @@ sudo ./linux-macos/setup-storage.sh
 ```
 Linux/macOS installer is native (no Docker required).
 
-One-line run from GitHub (Linux/macOS):
+One-line run from GitHub (Linux/macOS, same command for both):
 
 ```bash
 script="/tmp/setup-storage.sh"
@@ -78,6 +78,8 @@ curl -fsSL "https://raw.githubusercontent.com/keyhan-azarjoo/S3/main/linux-macos
 chmod +x "$script"
 sudo "$script"
 ```
+
+The same command above works on both Linux and macOS.
 
 ## Access URLs
 
