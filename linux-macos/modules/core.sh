@@ -206,12 +206,7 @@ server {
 EOF
   nginx -t
   if has_cmd systemctl; then
-    if systemctl is-enabled nginx >/dev/null 2>&1; then
-      :
-    else
-      systemctl unmask nginx >/dev/null 2>&1 || true
-      systemctl enable nginx >/dev/null 2>&1 || true
-    fi
+    systemctl unmask nginx >/dev/null 2>&1 || true
     systemctl restart nginx >/dev/null 2>&1 || systemctl start nginx >/dev/null 2>&1 || true
   else
     service nginx restart >/dev/null 2>&1 || service nginx start >/dev/null 2>&1 || true
