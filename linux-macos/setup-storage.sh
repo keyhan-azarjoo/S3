@@ -2,14 +2,50 @@
 
 set -euo pipefail
 
-module_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/modules" && pwd)"
+script_root="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+module_root="${script_root}/modules"
 module_files=(core.sh cleanup.sh platform.sh)
+remote_module_base="https://raw.githubusercontent.com/keyhan-azarjoo/S3/main/linux-macos/modules"
+
+initialize_module_root() {
+  local missing=0
+
+  mkdir -p "${module_root}"
+
+  for module_file in "${module_files[@]}"; do
+    module_path="${module_root}/${module_file}"
+    if [ -f "${module_path}" ]; then
+      continue
+    fi
+
+    echo "[INFO] Downloading missing module: ${module_file}"
+    if command -v curl >/dev/null 2>&1; then
+      curl -fsSL "${remote_module_base}/${module_file}" -o "${module_path}" || missing=1
+    elif command -v wget >/dev/null 2>&1; then
+      wget -qO "${module_path}" "${remote_module_base}/${module_file}" || missing=1
+    else
+      echo "[ERROR] curl or wget is required to download installer modules."
+      missing=1
+    fi
+
+    if [ "${missing}" -ne 0 ]; then
+      break
+    fi
+  done
+
+  if [ "${missing}" -ne 0 ]; then
+    echo "[ERROR] Failed to download required installer modules."
+    exit 1
+  fi
+}
+
+initialize_module_root
 
 for module_file in "${module_files[@]}"; do
   module_path="${module_root}/${module_file}"
   if [ ! -f "${module_path}" ]; then
     echo "[ERROR] Missing required module: ${module_path}"
-    echo "[ERROR] This runner now uses local files only. Keep the modules directory next to setup-storage.sh."
+    echo "[ERROR] Keep the modules directory next to setup-storage.sh or rerun with internet access."
     exit 1
   fi
 done
