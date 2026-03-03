@@ -205,8 +205,28 @@ server {
 }
 EOF
   nginx -t
-  systemctl enable --now nginx
-  systemctl restart nginx
+  if has_cmd systemctl; then
+    if systemctl is-enabled nginx >/dev/null 2>&1; then
+      :
+    else
+      systemctl unmask nginx >/dev/null 2>&1 || true
+      systemctl enable nginx >/dev/null 2>&1 || true
+    fi
+    systemctl restart nginx >/dev/null 2>&1 || systemctl start nginx >/dev/null 2>&1 || true
+  else
+    service nginx restart >/dev/null 2>&1 || service nginx start >/dev/null 2>&1 || true
+  fi
+
+  if ! port_free "$https_port"; then
+    return
+  fi
+
+  err "Nginx did not start correctly on port ${https_port}."
+  if has_cmd systemctl; then
+    warn "nginx.service status:"
+    systemctl status nginx --no-pager -l 2>/dev/null || true
+  fi
+  exit 1
 }
 
 configure_nginx_macos() {
