@@ -77,7 +77,11 @@ get_lan_ipv4() {
 
 ensure_prereqs_linux() {
   if has_cmd apt-get; then
-    apt-get update -y
+    if dpkg --audit 2>/dev/null | grep -q .; then
+      warn "dpkg was interrupted. Running 'dpkg --configure -a' automatically."
+      DEBIAN_FRONTEND=noninteractive dpkg --configure -a
+    fi
+    apt-get update
     apt-get install -y curl openssl nginx
   elif has_cmd dnf; then
     dnf install -y curl openssl nginx
@@ -336,4 +340,3 @@ main() {
 
 # The main runner now lives in ../setup-storage.sh. This core file only defines
 # the reusable install functions.
-
