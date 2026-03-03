@@ -294,9 +294,9 @@ function Normalize-HostInput([string]$raw) {
   if ($value -match ":") { $value = $value.Split(":")[0] }
   $value = $value.Trim().ToLowerInvariant()
 
-  if ($value -notmatch '^[a-z0-9]([a-z0-9\.-]*[a-z0-9])?$') {
+  if ($value -notmatch '^((\d{1,3}\.){3}\d{1,3}|[a-z0-9]([a-z0-9\.-]*[a-z0-9])?)$') {
     Err "Invalid domain/host input: '$raw'"
-    Err "Use values like: localhost, mystorage.local, mystorage.com, or https://mystorage.com"
+    Err "Use values like: localhost, <server-ip>, mystorage.local, mystorage.com, or https://mystorage.com"
     exit 1
   }
 

@@ -49,7 +49,7 @@ normalize_host_input() {
   v="${v%%/*}"
   v="${v%%:*}"
   v="$(echo "$v" | tr '[:upper:]' '[:lower:]')"
-  if ! echo "$v" | grep -Eq '^[a-z0-9]([a-z0-9.-]*[a-z0-9])?$'; then
+  if ! echo "$v" | grep -Eq '^(([0-9]{1,3}\.){3}[0-9]{1,3}|[a-z0-9]([a-z0-9.-]*[a-z0-9])?)$'; then
     err "Invalid domain/host: $raw"
     exit 1
   fi
@@ -316,7 +316,7 @@ trust_cert() {
 
 main() {
   relaunch_elevated "$@"
-  local os root cert_dir https_port api_port ui_port domain lan_ans enable_lan lan_ip public_ip use_public_ip
+  local os root cert_dir https_port api_port ui_port domain lan_ans enable_lan lan_ip public_ip use_public_ip proxy_host
   os="$(detect_os)"
   [ "$os" = "unknown" ] && { err "Unsupported OS."; exit 1; }
   info "===== Local S3 Storage Installer (${os}) - Native Mode ====="
@@ -384,10 +384,14 @@ main() {
   echo "===== INSTALLATION COMPLETE ====="
   echo "MinIO Console (direct): http://localhost:${ui_port}"
   echo "MinIO API (direct):     http://localhost:${api_port}"
+  proxy_host="$domain"
+  if [ "$proxy_host" = "localhost" ] && [ -n "$lan_ip" ]; then
+    proxy_host="$lan_ip"
+  fi
   if [ "$https_port" -eq 443 ]; then
-    echo "Proxy URL:              https://${domain}"
+    echo "Proxy URL:              https://${proxy_host}"
   else
-    echo "Proxy URL:              https://${domain}:${https_port}"
+    echo "Proxy URL:              https://${proxy_host}:${https_port}"
   fi
   if [ "$enable_lan" = true ] && [ -n "$lan_ip" ]; then
     if [ "$https_port" -eq 443 ]; then

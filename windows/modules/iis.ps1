@@ -204,7 +204,9 @@ function Ensure-IISProxyMode([string]$domain,[string]$siteRoot,[string]$certPath
 
   # Build SAN: always include localhost + 127.0.0.1, plus domain and LAN IP if present
   $sanExt = "2.5.29.17={text}DNS=localhost&IPAddress=127.0.0.1"
-  if ($domain -and $domain -ne "localhost") { $sanExt += "&DNS=$domain" }
+  if ($domain -and $domain -ne "localhost") {
+    if (Test-IPv4Literal $domain) { $sanExt += "&IPAddress=$domain" } else { $sanExt += "&DNS=$domain" }
+  }
   if ($lanIp) { $sanExt += "&IPAddress=$lanIp" }
 
   $rootCa = $null
@@ -377,7 +379,8 @@ function Install-IISMode {
 
   Run-PreflightChecks -DataPath $root
 
-  $publicUrl = if ($httpsPort -eq 443) { "https://$domain" } else { "https://${domain}:$httpsPort" }
+  $displayHost = if ($domain -eq "localhost" -and $lanIp) { $lanIp } else { $domain }
+  $publicUrl = if ($httpsPort -eq 443) { "https://$displayHost" } else { "https://${displayHost}:$httpsPort" }
   # If the selected host is localhost but LAN access is enabled, do not force a browser
   # redirect target. That allows users opening the console by LAN IP to stay on that IP.
   $consoleBrowserUrl = if ($consoleHttpsPort -eq 80) { "http://$domain" } else { "http://${domain}:$consoleHttpsPort" }

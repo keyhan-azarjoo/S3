@@ -229,7 +229,9 @@ function Ensure-LocalTlsCert([string]$dockerCtx, [string]$certDir, [string]$doma
   $crt = Join-Path $certDir "localhost.crt"
   $key = Join-Path $certDir "localhost.key"
   $san = "DNS:localhost,IP:127.0.0.1"
-  if ($domain -ne "localhost") { $san += ",DNS:$domain" }
+  if ($domain -ne "localhost") {
+    if (Test-IPv4Literal $domain) { $san += ",IP:$domain" } else { $san += ",DNS:$domain" }
+  }
   if ($lanIp) { $san += ",IP:$lanIp" }
 
   Info "Generating self-signed TLS certificate for localhost/$domain..."
@@ -379,7 +381,8 @@ function Write-FilesAndUp {
     Ensure-FirewallPort -port $consoleHttpsPort
   }
 
-  $publicUrl = if ($httpsPort -eq 443) { "https://$domain" } else { "https://${domain}:$httpsPort" }
+  $displayHost = if ($domain -eq "localhost" -and $lanIp) { $lanIp } else { $domain }
+  $publicUrl = if ($httpsPort -eq 443) { "https://$displayHost" } else { "https://${displayHost}:$httpsPort" }
   $consoleBrowserUrl = if ($consoleHttpsPort -eq 80) { "http://$domain" } else { "http://${domain}:$consoleHttpsPort" }
   $consoleRedirectUrl = if ($domain -eq "localhost" -and $lanIp) { "" } else { $consoleBrowserUrl }
 
