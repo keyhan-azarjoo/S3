@@ -77,10 +77,8 @@ get_lan_ipv4() {
 
 ensure_prereqs_linux() {
   if has_cmd apt-get; then
-    if dpkg --audit 2>/dev/null | grep -q .; then
-      warn "dpkg was interrupted. Running 'dpkg --configure -a' automatically."
-      DEBIAN_FRONTEND=noninteractive dpkg --configure -a
-    fi
+    warn "Ensuring dpkg is in a consistent state..."
+    DEBIAN_FRONTEND=noninteractive dpkg --configure -a || true
     apt-get update
     apt-get install -y curl openssl nginx
   elif has_cmd dnf; then
