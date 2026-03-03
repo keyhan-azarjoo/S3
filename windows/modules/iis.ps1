@@ -368,6 +368,13 @@ function Install-IISMode {
   # Exclude $httpsPort so the API and console bindings do not collide.
   $consoleCandidates = @(9443,10443,11443,12443,13443) | Where-Object { $_ -ne $httpsPort }
   $consoleHttpsPort = Resolve-RequiredPort -label "MinIO Console" -candidates $consoleCandidates -defaultPort ($httpsPort + 1000)
+  if (-not (Test-IISBindingPortAvailable -port $consoleHttpsPort -protocol "http" -excludeSite "LocalS3")) {
+    Warn "IIS already has an HTTP binding on port $consoleHttpsPort. Choosing another console port."
+    $alternateConsoleCandidates = $consoleCandidates | Where-Object {
+      $_ -ne $consoleHttpsPort -and (Test-IISBindingPortAvailable -port $_ -protocol "http" -excludeSite "LocalS3")
+    }
+    $consoleHttpsPort = Resolve-RequiredPort -label "MinIO Console" -candidates $alternateConsoleCandidates -defaultPort ($httpsPort + 2000)
+  }
 
   Run-PreflightChecks -DataPath $root
 
@@ -414,23 +421,38 @@ function Install-IISMode {
 
 
 function Resolve-HttpsPortForIIS {
-  if (Port-Free 443) {
-    $use443 = (Read-Host "Use HTTPS port 443? (Y/n)").Trim().ToLowerInvariant()
-    if ($use443 -eq "" -or $use443 -eq "y" -or $use443 -eq "yes") {
-      return 443
-    }
-  } else {
-    Warn "Port 443 is already in use."
+  if ((Port-Free 443) -and (Test-IISBindingPortAvailable -port 443 -protocol "https" -excludeSite "LocalS3")) {
+    return 443
   }
 
-  Write-Host "Choose HTTPS port option:"
-  Write-Host "  1) Auto alternate port (tries: 8443, 9443, 10443, 11443, 12443)"
-  Write-Host "  2) Enter custom port"
-  $choice = (Read-Host "Select option [1/2] (default: 1)").Trim()
-  if ($choice -eq "2") {
-    return Resolve-RequiredPort -label "HTTPS (IIS)" -candidates @() -defaultPort 8443
+  Warn "Port 443 is already in use or reserved by an existing IIS binding."
+  $candidates = @(8443,9443,10443,11443,12443) | Where-Object {
+    (Port-Free $_) -and (Test-IISBindingPortAvailable -port $_ -protocol "https" -excludeSite "LocalS3")
   }
-  return Resolve-RequiredPort -label "HTTPS (IIS)" -candidates @(8443,9443,10443,11443,12443) -defaultPort 8443
+  $picked = Pick-Port $candidates
+  if ($picked) { return [int]$picked }
+
+  Err "No available IIS HTTPS port was found in the default range (8443, 9443, 10443, 11443, 12443)."
+  exit 1
+}
+
+function Test-IISBindingPortAvailable([int]$port, [string]$protocol, [string]$excludeSite = "") {
+  try {
+    Import-Module WebAdministration -ErrorAction SilentlyContinue
+    $bindings = Get-WebBinding -Protocol $protocol -ErrorAction SilentlyContinue
+    foreach ($binding in $bindings) {
+      $siteName = $binding.ItemXPath -replace '^.*/sites/site\[@name=''([^'']+)''\].*$', '$1'
+      if ($excludeSite -and $siteName -eq $excludeSite) { continue }
+      $parts = $binding.bindingInformation.Split(':')
+      if ($parts.Count -lt 2) { continue }
+      $bindingPort = 0
+      if (-not [int]::TryParse($parts[1], [ref]$bindingPort)) { continue }
+      if ($bindingPort -eq $port) {
+        return $false
+      }
+    }
+  } catch {}
+  return $true
 }
 
 function Invoke-LocalS3IISSetup {
