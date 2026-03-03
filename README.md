@@ -57,9 +57,7 @@ Script reference:
 One-line run from GitHub (PowerShell, simpler bootstrap):
 
 ```powershell
-$script = Join-Path $env:TEMP 'setup-storage.ps1'
-Invoke-WebRequest -Uri 'https://raw.githubusercontent.com/keyhan-azarjoo/S3/main/setup-storage.ps1' -OutFile $script
-& $script
+$script = Join-Path $env:TEMP 'setup-storage.ps1'; Invoke-WebRequest -Uri 'https://raw.githubusercontent.com/keyhan-azarjoo/S3/main/setup-storage.ps1' -OutFile $script; & $script
 ```
 
 ## Linux/macOS Usage
@@ -73,10 +71,7 @@ Linux/macOS installer is native (no Docker required).
 One-line run from GitHub (Linux/macOS, same command for both):
 
 ```bash
-script="/tmp/setup-storage.sh"
-curl -fsSL "https://raw.githubusercontent.com/keyhan-azarjoo/S3/main/linux-macos/setup-storage.sh" -o "$script"
-chmod +x "$script"
-sudo "$script"
+script="/tmp/setup-storage.sh"; curl -fsSL "https://raw.githubusercontent.com/keyhan-azarjoo/S3/main/linux-macos/setup-storage.sh" -o "$script" && chmod +x "$script" && sudo "$script"
 ```
 
 The same command above works on both Linux and macOS.
