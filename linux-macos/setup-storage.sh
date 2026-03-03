@@ -9,16 +9,29 @@ remote_module_base="https://raw.githubusercontent.com/keyhan-azarjoo/S3/main/lin
 
 initialize_module_root() {
   local missing=0
+  local refresh_modules=0
+
+  if [ "${script_root}" = "/tmp" ] || [ "${script_root}" = "/var/tmp" ]; then
+    refresh_modules=1
+  fi
 
   mkdir -p "${module_root}"
 
+  if [ "${refresh_modules}" -eq 1 ]; then
+    rm -f "${module_root}/core.sh" "${module_root}/cleanup.sh" "${module_root}/platform.sh"
+  fi
+
   for module_file in "${module_files[@]}"; do
     module_path="${module_root}/${module_file}"
-    if [ -f "${module_path}" ]; then
+    if [ "${refresh_modules}" -eq 0 ] && [ -f "${module_path}" ]; then
       continue
     fi
 
-    echo "[INFO] Downloading missing module: ${module_file}"
+    if [ -f "${module_path}" ]; then
+      echo "[INFO] Refreshing module: ${module_file}"
+    else
+      echo "[INFO] Downloading missing module: ${module_file}"
+    fi
     if command -v curl >/dev/null 2>&1; then
       curl -fsSL "${remote_module_base}/${module_file}" -o "${module_path}" || missing=1
     elif command -v wget >/dev/null 2>&1; then
