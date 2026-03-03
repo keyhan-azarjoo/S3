@@ -22,6 +22,7 @@ function Remove-StaleTempModules {
   }
 }
 
+
 function Initialize-ModuleRoot {
   $tempPath = [System.IO.Path]::GetFullPath($env:TEMP).TrimEnd('\')
   $scriptPath = [System.IO.Path]::GetFullPath($PSScriptRoot).TrimEnd('\')
