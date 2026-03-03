@@ -381,7 +381,7 @@ function Write-FilesAndUp {
   }
 
   $publicUrl = if ($httpsPort -eq 443) { "https://$domain" } else { "https://${domain}:$httpsPort" }
-  $consoleBrowserUrl = if ($consoleHttpsPort -eq 443) { "https://$domain" } else { "https://${domain}:$consoleHttpsPort" }
+  $consoleBrowserUrl = if ($consoleHttpsPort -eq 80) { "http://$domain" } else { "http://${domain}:$consoleHttpsPort" }
   $consoleRedirectUrl = if ($domain -eq "localhost" -and $lanIp) { "" } else { $consoleBrowserUrl }
 
   Info "Using ports:"
@@ -489,20 +489,9 @@ server {
 }
 
 server {
-    listen 4443 ssl;
-    http2 on;
+    listen 4443;
     server_name $serverNames;
 
-    ssl_certificate     /etc/nginx/certs/localhost.crt;
-    ssl_certificate_key /etc/nginx/certs/localhost.key;
-
-    ssl_protocols       TLSv1.2 TLSv1.3;
-    ssl_ciphers         HIGH:!aNULL:!MD5;
-    ssl_prefer_server_ciphers on;
-    ssl_session_cache   shared:SSL:10m;
-    ssl_session_timeout 10m;
-
-    add_header Strict-Transport-Security "max-age=31536000; includeSubDomains" always;
     add_header X-Frame-Options SAMEORIGIN always;
     add_header X-Content-Type-Options nosniff always;
     add_header X-XSS-Protection "1; mode=block" always;
@@ -630,12 +619,12 @@ server {
   Write-Host "===== INSTALLATION COMPLETE ====="
   Write-Host ""
   Write-Host "URLs:"
-  Write-Host "  MinIO Console HTTPS:    $consoleBrowserUrl"
+  Write-Host "  MinIO Console:          $consoleBrowserUrl"
   Write-Host "  S3 API / Share links:   $publicUrl"
   Write-Host "  MinIO Console (direct): http://localhost:$minioUI"
   Write-Host "  MinIO API (direct):     http://localhost:$minioApi"
   if ($enableLan -and $lanIp) {
-    $lanConsoleUrl = if ($consoleHttpsPort -eq 443) { "https://$lanIp" } else { "https://${lanIp}:$consoleHttpsPort" }
+    $lanConsoleUrl = if ($consoleHttpsPort -eq 80) { "http://$lanIp" } else { "http://${lanIp}:$consoleHttpsPort" }
     $lanApiUrl = if ($httpsPort -eq 443) { "https://$lanIp" } else { "https://${lanIp}:$httpsPort" }
     Write-Host "  LAN Console:            $lanConsoleUrl"
     Write-Host "  LAN S3 API:             $lanApiUrl"
@@ -660,10 +649,10 @@ server {
     Write-Host "For other computers on the LAN:"
     if ($domain -ne "localhost") {
       Write-Host "  Add hosts entry: $lanIp $domain"
-      if ($consoleHttpsPort -eq 443) { Write-Host "  Then open: https://$domain" } else { Write-Host "  Then open: https://${domain}:$consoleHttpsPort" }
+      if ($consoleHttpsPort -eq 80) { Write-Host "  Then open: http://$domain" } else { Write-Host "  Then open: http://${domain}:$consoleHttpsPort" }
       if ($httpsPort -eq 443) { Write-Host "  S3 API: https://$domain" } else { Write-Host "  S3 API: https://${domain}:$httpsPort" }
     } else {
-      if ($consoleHttpsPort -eq 443) { Write-Host "  Open: https://$lanIp" } else { Write-Host "  Open: https://${lanIp}:$consoleHttpsPort" }
+      if ($consoleHttpsPort -eq 80) { Write-Host "  Open: http://$lanIp" } else { Write-Host "  Open: http://${lanIp}:$consoleHttpsPort" }
       if ($httpsPort -eq 443) { Write-Host "  S3 API: https://$lanIp" } else { Write-Host "  S3 API: https://${lanIp}:$httpsPort" }
     }
     Write-Host "  Trust cert on client: $($ngcerts)\\localhost.crt"
