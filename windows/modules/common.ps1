@@ -304,15 +304,7 @@ function Normalize-HostInput([string]$raw) {
 }
 
 function Resolve-BrowserSessionDuration {
-  $defaultValue = "3650d"
-  while ($true) {
-    $raw = (Read-Host "Enter web session/share-link max duration (examples: 12h, 2d, 3650d) (default: $defaultValue)").Trim()
-    if ([string]::IsNullOrWhiteSpace($raw)) { return $defaultValue }
-    $value = $raw.ToLowerInvariant()
-    if ($value -match '^[1-9][0-9]*(s|m|h|d)$') { return $value }
-    Warn "Invalid duration: $raw"
-    Warn "Use a positive number followed by one unit: s, m, h, or d."
-  }
+  return "3650d"
 }
 
 function Test-TcpPort([string]$targetHost, [int]$port, [int]$timeoutMs = 1500) {

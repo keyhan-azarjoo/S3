@@ -357,18 +357,12 @@ function Write-FilesAndUp {
       Write-Host "Port 443 listeners:"
       $listeners | Format-Table -AutoSize | Out-String | Write-Host
     }
-    $ans = (Read-Host "Use alternate HTTPS port (8443/9443/10443)? (y/N)").Trim().ToLowerInvariant()
-    if ($ans -eq "y" -or $ans -eq "yes") {
-      $nginxHttps = Pick-Port @(8443,9443,10443)
-      if (-not $nginxHttps) {
-        Err "No free alternate HTTPS port (8443/9443/10443)."
-        exit 1
-      }
-      Warn "Using alternate HTTPS port: $nginxHttps"
-    } else {
-      Err "Port 443 is required but currently in use. Free it and rerun."
+    $nginxHttps = Pick-Port @(8443,9443,10443)
+    if (-not $nginxHttps) {
+      Err "Port 443 is busy and no free alternate HTTPS port is available (8443/9443/10443)."
       exit 1
     }
+    Warn "Using alternate HTTPS port: $nginxHttps"
   }
 
   $minioApi = Pick-Port @(9000,19000,29000)
