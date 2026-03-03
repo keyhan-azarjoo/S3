@@ -136,8 +136,39 @@ ensure_prereqs_macos() {
 
 install_minio_binary() {
   local bin_path="$1"
+  local os release_name url downloaded=0
+  local urls=()
   info "Installing MinIO binary..."
-  curl -fL "https://dl.min.io/server/minio/release/$(uname | tr '[:upper:]' '[:lower:]')-amd64/minio" -o "$bin_path"
+  os="$(uname | tr '[:upper:]' '[:lower:]')"
+  release_name="RELEASE.2025-04-22T22-12-26Z"
+
+  if [ "$os" = "linux" ]; then
+    urls+=(
+      "https://dl.min.io/server/minio/release/linux-amd64/archive/minio.${release_name}"
+      "https://dl.min.io/server/minio/release/linux-amd64/archive/minio.RELEASE.2025-01-18T00-31-37Z"
+      "https://dl.min.io/server/minio/release/linux-amd64/minio"
+    )
+  elif [ "$os" = "darwin" ]; then
+    urls+=(
+      "https://dl.min.io/server/minio/release/darwin-amd64/archive/minio.${release_name}"
+      "https://dl.min.io/server/minio/release/darwin-amd64/archive/minio.RELEASE.2025-01-18T00-31-37Z"
+      "https://dl.min.io/server/minio/release/darwin-amd64/minio"
+    )
+  else
+    urls+=("https://dl.min.io/server/minio/release/${os}-amd64/minio")
+  fi
+
+  for url in "${urls[@]}"; do
+    if curl -fL "$url" -o "$bin_path"; then
+      downloaded=1
+      break
+    fi
+  done
+
+  if [ "$downloaded" -ne 1 ]; then
+    err "Failed to download MinIO binary."
+    exit 1
+  fi
   chmod +x "$bin_path"
 }
 
@@ -148,7 +179,7 @@ configure_minio_linux() {
   local envf="/etc/default/locals3-minio"
   mkdir -p "$root" "$data"
 
-  [ -x "$bin" ] || install_minio_binary "$bin"
+  install_minio_binary "$bin"
 
   cat > "$envf" <<EOF
 MINIO_ROOT_USER=admin
@@ -180,7 +211,7 @@ configure_minio_macos() {
   local data="${root}/data"
   local plist="/Library/LaunchDaemons/com.locals3.minio.plist"
   mkdir -p "$root" "$data"
-  [ -x "$bin" ] || install_minio_binary "$bin"
+  install_minio_binary "$bin"
 
   cat > "$plist" <<EOF
 <?xml version="1.0" encoding="UTF-8"?>
