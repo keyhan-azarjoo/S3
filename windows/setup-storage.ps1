@@ -1643,7 +1643,7 @@ function Trust-LocalTlsCert([string]$certPath) {
   }
 }
 
-function Start-ContainersFallback([string]$dockerCtx, [string]$ngconf, [string]$ngcerts, [string]$minioVolume, [string]$minioImage, [int]$consoleHttpsPort, [int]$apiHttpsPort, [int]$minioApi, [int]$minioUI, [string]$consoleProxyUrl, [string]$browserSessionDuration) {
+function Start-ContainersFallback([string]$dockerCtx, [string]$ngconf, [string]$ngcerts, [string]$minioVolume, [string]$minioImage, [string]$dashboardImage, [int]$consoleHttpsPort, [int]$apiHttpsPort, [int]$minioApi, [int]$minioUI, [int]$dashboardPort, [string]$consoleProxyUrl, [string]$browserSessionDuration, [string]$consolePassphrase, [string]$consoleSalt) {
   Warn "Falling back to direct 'docker run' startup (compose unavailable in this environment)."
   $network = "storage-net"
 
@@ -1674,6 +1674,23 @@ function Start-ContainersFallback([string]$dockerCtx, [string]$ngconf, [string]$
   }
 
   docker --context $dockerCtx run -d `
+    --name console `
+    --label $Script:LocalS3Label `
+    --label "com.locals3.role=console" `
+    --network $network `
+    -e CONSOLE_MINIO_SERVER="http://minio:9000" `
+    -e CONSOLE_PBKDF_PASSPHRASE="${consolePassphrase}" `
+    -e CONSOLE_PBKDF_SALT="${consoleSalt}" `
+    -p "${dashboardPort}:9090" `
+    $dashboardImage | Out-Null
+  $consoleExit = $LASTEXITCODE
+  if ($consoleExit -ne 0) {
+    $ErrorActionPreference = $prev
+    Err "Failed to start opens3 Console via fallback mode."
+    exit 1
+  }
+
+  docker --context $dockerCtx run -d `
     --name nginx `
     --label $Script:LocalS3Label `
     --label "com.locals3.role=nginx" `
@@ -1697,7 +1714,10 @@ function Write-FilesAndUp {
   $ngcerts = Join-Path $project "nginx\certs"
   $data   = Join-Path $project "data"
   $minioVolume = "locals3-minio-data"
-  $minioImage = "minio/minio:RELEASE.2025-04-22T22-12-26Z"
+  $minioImage = "minio/minio:latest"
+  $dashboardImage = "opens3/console:latest"
+  $consolePassphrase = ([guid]::NewGuid().ToString("N") + [guid]::NewGuid().ToString("N"))
+  $consoleSalt = ([guid]::NewGuid().ToString("N"))
 
   $domainInput = Read-Host "Enter local domain/URL for HTTPS (default: localhost)"
   $domain = Normalize-HostInput $domainInput
@@ -1728,6 +1748,7 @@ function Write-FilesAndUp {
   $nginxHttps  = 443
   $minioApi    = Pick-Port @(9000,19000,29000)
   $minioUI     = Pick-Port @(9001,19001,29001)
+  $dashboardPort = Pick-Port @(9090,19090,29090)
 
   if (-not (Port-Free $nginxHttps)) {
     Warn "Port 443 is already in use."
@@ -1751,6 +1772,7 @@ function Write-FilesAndUp {
   }
   if (-not $minioApi)  { Err "No free port for MinIO API (9000/19000/29000)."; exit 1 }
   if (-not $minioUI)   { Err "No free port for MinIO UI (9001/19001/29001)."; exit 1 }
+  if (-not $dashboardPort) { Err "No free port for Dashboard UI (9090/19090/29090)."; exit 1 }
   $apiHttpsCandidates = @(8443,9443,10443,11443,12443) | Where-Object { $_ -ne $nginxHttps }
   $apiHttpsDefault = if ($nginxHttps -eq 8443) { 9443 } else { 8443 }
   $apiHttps = Resolve-RequiredPort -label "HTTPS S3 API" -candidates $apiHttpsCandidates -defaultPort $apiHttpsDefault
@@ -1768,6 +1790,7 @@ function Write-FilesAndUp {
   Info " - S3 API HTTPS: $apiHttps"
   Info " - MinIO API:  $minioApi"
   Info " - MinIO UI:   $minioUI"
+  Info " - Dashboard UI: $dashboardPort"
 
   New-Item -ItemType Directory -Force -Path $ngconf | Out-Null
   New-Item -ItemType Directory -Force -Path $ngcerts | Out-Null
@@ -1808,6 +1831,23 @@ services:
         limits:
           memory: 1g
 
+  console:
+    image: $dashboardImage
+    container_name: console
+    labels:
+      - "com.locals3.installer=true"
+      - "com.locals3.role=console"
+    environment:
+      CONSOLE_MINIO_SERVER: "http://minio:9000"
+      CONSOLE_PBKDF_PASSPHRASE: "$consolePassphrase"
+      CONSOLE_PBKDF_SALT: "$consoleSalt"
+    ports:
+      - "$dashboardPort:9090"
+    depends_on:
+      minio:
+        condition: service_healthy
+    restart: unless-stopped
+
   nginx:
     image: nginx:latest
     container_name: nginx
@@ -1821,8 +1861,8 @@ services:
       - ./nginx/conf:/etc/nginx/conf.d:ro
       - ./nginx/certs:/etc/nginx/certs:ro
     depends_on:
-      minio:
-        condition: service_healthy
+      console:
+        condition: service_started
     restart: unless-stopped
 
 volumes:
@@ -1862,9 +1902,9 @@ server {
     # Allow large file uploads (up to 5 GB)
     client_max_body_size 5g;
 
-    # MinIO Console (web dashboard + WebSocket)
+    # Opens3 Console (web dashboard + WebSocket)
     location / {
-        proxy_pass         http://minio:9001;
+        proxy_pass         http://console:9090;
         proxy_http_version 1.1;
         proxy_set_header Host            `$http_host;
         proxy_set_header X-Real-IP       `$remote_addr;
@@ -1963,14 +2003,17 @@ server {
   Start-Sleep -Seconds 3
 
   $names = @(docker --context $dockerCtx ps --format "{{.Names}}")
-  if ($names -notcontains "minio" -or $names -notcontains "nginx") {
+  if ($names -notcontains "minio" -or $names -notcontains "console" -or $names -notcontains "nginx") {
     Warn "Containers not running as expected. Logs:"
     $ErrorActionPreference = "Continue"
     if ($usedFallback) {
-      docker --context $dockerCtx ps -a --filter "name=minio" --filter "name=nginx" --format "table {{.Names}}\t{{.Status}}\t{{.Ports}}" 2>&1
+      docker --context $dockerCtx ps -a --filter "name=minio" --filter "name=console" --filter "name=nginx" --format "table {{.Names}}\t{{.Status}}\t{{.Ports}}" 2>&1
       Write-Host ""
       Write-Host "--- minio logs ---"
       docker --context $dockerCtx logs --tail 200 minio 2>&1
+      Write-Host ""
+      Write-Host "--- console logs ---"
+      docker --context $dockerCtx logs --tail 200 console 2>&1
       Write-Host ""
       Write-Host "--- nginx logs ---"
       docker --context $dockerCtx logs --tail 200 nginx 2>&1
@@ -2012,8 +2055,23 @@ server {
   }
   Info "MinIO is healthy and accepting requests."
 
+  Info "Waiting for dashboard to become ready..."
+  if (-not (Wait-TcpPort -targetHost "127.0.0.1" -port $dashboardPort -maxSeconds 60)) {
+    Warn "Dashboard port $dashboardPort did not become ready in 60 seconds."
+    $ErrorActionPreference = "Continue"
+    if ($usedFallback) {
+      docker --context $dockerCtx logs --tail 80 console 2>&1
+    } else {
+      docker --context $dockerCtx compose logs --no-color --tail 80 console 2>&1
+    }
+    $ErrorActionPreference = $prev
+    Pop-Location
+    Err "Dashboard did not start in time. Check container logs above."
+    exit 1
+  }
+
   # Auto-configure buckets, CORS, service accounts
-  Configure-MinIOFeatures -ApiPort $minioApi -UiPort $minioUI
+  Configure-MinIOFeatures -ApiPort $minioApi -UiPort $dashboardPort
 
   Pop-Location
 
@@ -2021,7 +2079,8 @@ server {
   Write-Host "===== INSTALLATION COMPLETE ====="
   Write-Host ""
   Write-Host "URLs:"
-  Write-Host "  MinIO Console (dashboard): http://localhost:$minioUI"
+  Write-Host "  Dashboard (opens3):        http://localhost:$dashboardPort"
+  Write-Host "  MinIO Embedded UI:         http://localhost:$minioUI"
   Write-Host "  MinIO API (S3):            http://localhost:$minioApi"
   Write-Host "  HTTPS Console:             $consoleProxyUrl"
   Write-Host "  HTTPS S3 API:              $apiProxyUrl"
@@ -2041,7 +2100,7 @@ server {
   Write-Host "  documents"
   Write-Host "  backups"
   Write-Host ""
-  Write-Host "Read-only service account (for apps / SDKs):"
+    Write-Host "Read-only service account (for apps / SDKs):"
   Write-Host "  Access key : readonly-app"
   Write-Host "  Secret key : ReadOnly#App2024!"
   Write-Host ""
