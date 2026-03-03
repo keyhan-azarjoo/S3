@@ -79,6 +79,10 @@ ensure_prereqs_linux() {
   if has_cmd apt-get; then
     warn "Ensuring dpkg is in a consistent state..."
     DEBIAN_FRONTEND=noninteractive dpkg --configure -a || true
+    if has_cmd systemctl; then
+      warn "Ensuring nginx.service is not masked before package install..."
+      systemctl unmask nginx >/dev/null 2>&1 || true
+    fi
     apt-get update
     apt-get install -y curl openssl nginx
   elif has_cmd dnf; then
