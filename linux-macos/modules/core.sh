@@ -10,6 +10,19 @@ err()  { echo "[ERROR] $*"; }
 
 has_cmd() { command -v "$1" >/dev/null 2>&1; }
 
+is_ipv4_literal() {
+  echo "$1" | grep -Eq '^([0-9]{1,3}\.){3}[0-9]{1,3}$'
+}
+
+is_private_ipv4() {
+  local ip="$1"
+  case "$ip" in
+    10.*|127.*|169.254.*|192.168.*) return 0 ;;
+    172.1[6-9].*|172.2[0-9].*|172.3[0-1].*) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
 detect_os() {
   case "$(uname -s)" in
     Linux*) echo "linux" ;;
@@ -73,6 +86,24 @@ get_lan_ipv4() {
     [ -z "$ip" ] && ip="$(ipconfig getifaddr en1 2>/dev/null || true)"
   fi
   echo "$ip"
+}
+
+get_public_ipv4() {
+  local candidate
+  if [ "$(detect_os)" != "linux" ] || ! has_cmd ip; then
+    echo ""
+    return
+  fi
+
+  while IFS= read -r candidate; do
+    candidate="${candidate%%/*}"
+    if [ -n "$candidate" ] && ! is_private_ipv4 "$candidate"; then
+      echo "$candidate"
+      return
+    fi
+  done < <(ip -4 -o addr show scope global 2>/dev/null | awk '{print $4}')
+
+  echo ""
 }
 
 ensure_prereqs_linux() {
@@ -180,7 +211,13 @@ generate_cert() {
   local cert_dir="$1" domain="$2" lan_ip="$3"
   local crt="$cert_dir/localhost.crt" key="$cert_dir/localhost.key"
   local san="DNS:localhost,IP:127.0.0.1"
-  [ "$domain" != "localhost" ] && san="$san,DNS:$domain"
+  if [ "$domain" != "localhost" ]; then
+    if is_ipv4_literal "$domain"; then
+      san="$san,IP:$domain"
+    else
+      san="$san,DNS:$domain"
+    fi
+  fi
   [ -n "$lan_ip" ] && san="$san,IP:$lan_ip"
   mkdir -p "$cert_dir"
   openssl req -x509 -nodes -newkey rsa:2048 -days 825 \
@@ -259,6 +296,7 @@ EOF
 ensure_hosts_entry() {
   local domain="$1" ip="$2"
   [ "$domain" = "localhost" ] && return
+  is_ipv4_literal "$domain" && return
   grep -Eq "^[[:space:]]*${ip}[[:space:]]+.*\\b${domain}\\b" /etc/hosts && return
   echo "${ip} ${domain}" >> /etc/hosts
 }
@@ -278,13 +316,23 @@ trust_cert() {
 
 main() {
   relaunch_elevated "$@"
-  local os root cert_dir https_port api_port ui_port domain lan_ans enable_lan lan_ip
+  local os root cert_dir https_port api_port ui_port domain lan_ans enable_lan lan_ip public_ip use_public_ip
   os="$(detect_os)"
   [ "$os" = "unknown" ] && { err "Unsupported OS."; exit 1; }
   info "===== Local S3 Storage Installer (${os}) - Native Mode ====="
 
   read -r -p "Enter local domain/URL for HTTPS (default: localhost): " domain
   domain="$(normalize_host_input "${domain:-}")"
+  if [ "$domain" = "localhost" ]; then
+    public_ip="$(get_public_ipv4)"
+    if [ -n "$public_ip" ]; then
+      read -r -p "Detected public/static IP ${public_ip}. Use it instead of localhost? (y/N): " use_public_ip
+      use_public_ip="$(echo "${use_public_ip:-n}" | tr '[:upper:]' '[:lower:]')"
+      if [ "$use_public_ip" = "y" ] || [ "$use_public_ip" = "yes" ]; then
+        domain="$public_ip"
+      fi
+    fi
+  fi
   read -r -p "Allow LAN access from other computers? (y/N): " lan_ans
   lan_ans="$(echo "${lan_ans:-n}" | tr '[:upper:]' '[:lower:]')"
   enable_lan=false

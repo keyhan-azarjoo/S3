@@ -328,8 +328,7 @@ function Install-IISMode {
   $siteRoot = Join-Path $root "iis-site"
   New-Item -ItemType Directory -Force -Path $certDir,$siteRoot | Out-Null
 
-  $domainInput = Read-Host "Enter local domain/URL for HTTPS (default: localhost)"
-  $domain = Normalize-HostInput $domainInput
+  $domain = Resolve-InstallHost "Enter local domain/URL for HTTPS (default: localhost)"
   Info "Using local domain: $domain"
   $browserSessionDuration = Resolve-BrowserSessionDuration
   Info "Web session/share-link max duration: $browserSessionDuration"

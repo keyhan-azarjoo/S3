@@ -303,6 +303,20 @@ function Normalize-HostInput([string]$raw) {
   return $value
 }
 
+function Test-IPv4Literal([string]$value) {
+  return $value -match '^(\d{1,3}\.){3}\d{1,3}$'
+}
+
+function Test-PrivateIPv4([string]$ip) {
+  return (
+    $ip -like "10.*" -or
+    $ip -like "127.*" -or
+    $ip -like "169.254.*" -or
+    $ip -like "192.168.*" -or
+    $ip -match '^172\.(1[6-9]|2[0-9]|3[0-1])\.'
+  )
+}
+
 function Resolve-BrowserSessionDuration {
   return "3650d"
 }
@@ -435,6 +449,53 @@ function Get-LanIPv4 {
   }
 }
 
+function Get-PublicIPv4 {
+  try {
+    $ip = Get-NetIPAddress -AddressFamily IPv4 -PrefixOrigin Manual -ErrorAction SilentlyContinue |
+      Where-Object {
+        $_.IPAddress -and
+        $_.IPAddress -ne "127.0.0.1" -and
+        $_.IPAddress -notlike "169.254.*" -and
+        -not (Test-PrivateIPv4 $_.IPAddress) -and
+        $_.InterfaceAlias -notmatch "vEthernet|Hyper-V|WSL|Loopback"
+      } |
+      Select-Object -First 1 -ExpandProperty IPAddress
+    if ($ip) { return $ip }
+  } catch {}
+
+  try {
+    $ip = Get-NetIPAddress -AddressFamily IPv4 -ErrorAction SilentlyContinue |
+      Where-Object {
+        $_.IPAddress -and
+        $_.IPAddress -ne "127.0.0.1" -and
+        $_.IPAddress -notlike "169.254.*" -and
+        -not (Test-PrivateIPv4 $_.IPAddress) -and
+        $_.InterfaceAlias -notmatch "vEthernet|Hyper-V|WSL|Loopback"
+      } |
+      Select-Object -First 1 -ExpandProperty IPAddress
+    return $ip
+  } catch {
+    return $null
+  }
+}
+
+function Resolve-InstallHost([string]$prompt) {
+  $domainInput = Read-Host $prompt
+  $domain = Normalize-HostInput $domainInput
+
+  if ($domain -eq "localhost") {
+    $publicIp = Get-PublicIPv4
+    if ($publicIp) {
+      $usePublicIp = (Read-Host "Detected public/static IP $publicIp. Use it instead of localhost? (y/N)").Trim().ToLowerInvariant()
+      if ($usePublicIp -eq "y" -or $usePublicIp -eq "yes") {
+        $domain = $publicIp
+      }
+    }
+  }
+
+  return $domain
+}
+
 function Ensure-FirewallPort([int]$port) {
   $ruleName = "Local S3 HTTPS $port"
   $rule = Get-NetFirewallRule -DisplayName $ruleName -ErrorAction SilentlyContinue
@@ -448,7 +509,7 @@ function Ensure-FirewallPort([int]$port) {
 }
 
 function Ensure-HostsEntry([string]$domain) {
-  if ($domain -eq "localhost") { return }
+  if ($domain -eq "localhost" -or (Test-IPv4Literal $domain)) { return }
   $hostsPath = Join-Path $env:SystemRoot "System32\\drivers\\etc\\hosts"
   $escaped = [regex]::Escape($domain)
   $existing = Get-Content -Path $hostsPath -ErrorAction SilentlyContinue

@@ -332,8 +332,7 @@ function Write-FilesAndUp {
   $minioVolume = "locals3-minio-data"
   $minioImage = "firstfinger/minio:latest-amd64"
 
-  $domainInput = Read-Host "Enter local domain/URL for HTTPS (default: localhost)"
-  $domain = Normalize-HostInput $domainInput
+  $domain = Resolve-InstallHost "Enter local domain/URL for HTTPS (default: localhost)"
   Info "Using local domain: $domain"
   $browserSessionDuration = Resolve-BrowserSessionDuration
   Info "Web session/share-link max duration: $browserSessionDuration"
