@@ -1651,21 +1651,25 @@ function Start-ContainersFallback([string]$dockerCtx, [string]$ngconf, [string]$
   $ErrorActionPreference = "Continue"
   docker --context $dockerCtx network create $network 2>$null | Out-Null
   docker --context $dockerCtx volume create $minioVolume 2>$null | Out-Null
-  docker --context $dockerCtx rm -f minio nginx 2>$null | Out-Null
+  docker --context $dockerCtx rm -f minio console nginx 2>$null | Out-Null
 
-  docker --context $dockerCtx run -d `
-    --name minio `
-    --label $Script:LocalS3Label `
-    --label "com.locals3.role=minio" `
-    --network $network `
-    -e MINIO_ROOT_USER=admin `
-    -e MINIO_ROOT_PASSWORD=StrongPassword123 `
-    -e MINIO_BROWSER_REDIRECT_URL="${consoleProxyUrl}" `
-    -e MINIO_BROWSER_SESSION_DURATION="${browserSessionDuration}" `
-    -p "${minioApi}:9000" `
-    -p "${minioUI}:9001" `
-    -v "${minioVolume}:/data" `
-    $minioImage server /data --console-address ":9001" | Out-Null
+  $minioArgs = @(
+    "--context", $dockerCtx, "run", "-d",
+    "--name", "minio",
+    "--label", $Script:LocalS3Label,
+    "--label", "com.locals3.role=minio",
+    "--network", $network,
+    "-e", "MINIO_ROOT_USER=admin",
+    "-e", "MINIO_ROOT_PASSWORD=StrongPassword123",
+    "-e", "MINIO_BROWSER_REDIRECT_URL=$consoleProxyUrl",
+    "-e", "MINIO_BROWSER_SESSION_DURATION=$browserSessionDuration",
+    "-p", "${minioApi}:9000",
+    "-p", "${minioUI}:9001",
+    "-v", "${minioVolume}:/data",
+    $minioImage,
+    "server", "/data", "--console-address", ":9001"
+  )
+  docker @minioArgs | Out-Null
   $minioExit = $LASTEXITCODE
   if ($minioExit -ne 0) {
     $ErrorActionPreference = $prev
@@ -1673,16 +1677,19 @@ function Start-ContainersFallback([string]$dockerCtx, [string]$ngconf, [string]$
     exit 1
   }
 
-  docker --context $dockerCtx run -d `
-    --name console `
-    --label $Script:LocalS3Label `
-    --label "com.locals3.role=console" `
-    --network $network `
-    -e CONSOLE_MINIO_SERVER="http://minio:9000" `
-    -e CONSOLE_PBKDF_PASSPHRASE="${consolePassphrase}" `
-    -e CONSOLE_PBKDF_SALT="${consoleSalt}" `
-    -p "${dashboardPort}:9090" `
-    $dashboardImage | Out-Null
+  $consoleArgs = @(
+    "--context", $dockerCtx, "run", "-d",
+    "--name", "console",
+    "--label", $Script:LocalS3Label,
+    "--label", "com.locals3.role=console",
+    "--network", $network,
+    "-e", "CONSOLE_MINIO_SERVER=http://minio:9000",
+    "-e", "CONSOLE_PBKDF_PASSPHRASE=$consolePassphrase",
+    "-e", "CONSOLE_PBKDF_SALT=$consoleSalt",
+    "-p", "${dashboardPort}:9090",
+    $dashboardImage
+  )
+  docker @consoleArgs | Out-Null
   $consoleExit = $LASTEXITCODE
   if ($consoleExit -ne 0) {
     $ErrorActionPreference = $prev
@@ -1690,16 +1697,19 @@ function Start-ContainersFallback([string]$dockerCtx, [string]$ngconf, [string]$
     exit 1
   }
 
-  docker --context $dockerCtx run -d `
-    --name nginx `
-    --label $Script:LocalS3Label `
-    --label "com.locals3.role=nginx" `
-    --network $network `
-    -p "${consoleHttpsPort}:443" `
-    -p "${apiHttpsPort}:4443" `
-    -v "${ngconf}:/etc/nginx/conf.d:ro" `
-    -v "${ngcerts}:/etc/nginx/certs:ro" `
-    nginx:latest | Out-Null
+  $nginxArgs = @(
+    "--context", $dockerCtx, "run", "-d",
+    "--name", "nginx",
+    "--label", $Script:LocalS3Label,
+    "--label", "com.locals3.role=nginx",
+    "--network", $network,
+    "-p", "${consoleHttpsPort}:443",
+    "-p", "${apiHttpsPort}:4443",
+    "-v", "${ngconf}:/etc/nginx/conf.d:ro",
+    "-v", "${ngcerts}:/etc/nginx/certs:ro",
+    "nginx:latest"
+  )
+  docker @nginxArgs | Out-Null
   $nginxExit = $LASTEXITCODE
   $ErrorActionPreference = $prev
   if ($nginxExit -ne 0) {
@@ -2071,7 +2081,7 @@ server {
   }
 
   # Auto-configure buckets, CORS, service accounts
-  Configure-MinIOFeatures -ApiPort $minioApi -UiPort $dashboardPort
+  Configure-MinIOFeatures -ApiPort $minioApi -UiPort $minioUI
 
   Pop-Location
 
