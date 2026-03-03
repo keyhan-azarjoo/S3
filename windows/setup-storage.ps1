@@ -3,7 +3,11 @@ $moduleFiles = @("common.ps1","minio.ps1","cleanup.ps1","iis.ps1","docker.ps1","
 $remoteModuleBase = "https://raw.githubusercontent.com/keyhan-azarjoo/S3/main/windows/modules"
 
 function Initialize-ModuleRoot {
-  if ((Test-Path $moduleRoot) -and ($moduleFiles | ForEach-Object { Test-Path (Join-Path $moduleRoot $_) } | Where-Object { -not $_ }).Count -eq 0) {
+  $tempPath = [System.IO.Path]::GetFullPath($env:TEMP).TrimEnd('\')
+  $scriptPath = [System.IO.Path]::GetFullPath($PSScriptRoot).TrimEnd('\')
+  $refreshModules = $scriptPath.StartsWith($tempPath, [System.StringComparison]::OrdinalIgnoreCase)
+
+  if (-not $refreshModules -and (Test-Path $moduleRoot) -and ($moduleFiles | ForEach-Object { Test-Path (Join-Path $moduleRoot $_) } | Where-Object { -not $_ }).Count -eq 0) {
     return
   }
 
@@ -14,12 +18,13 @@ function Initialize-ModuleRoot {
 
     foreach ($moduleFile in $moduleFiles) {
       $modulePath = Join-Path $moduleRoot $moduleFile
-      if (Test-Path $modulePath) {
+      if ((-not $refreshModules) -and (Test-Path $modulePath)) {
         continue
       }
 
       $moduleUrl = "$remoteModuleBase/$moduleFile"
-      Write-Host "[INFO] Downloading missing module: $moduleFile" -ForegroundColor Yellow
+      $action = if (Test-Path $modulePath) { "Refreshing" } else { "Downloading missing" }
+      Write-Host "[INFO] $action module: $moduleFile" -ForegroundColor Yellow
       Invoke-WebRequest -Uri $moduleUrl -OutFile $modulePath -UseBasicParsing
     }
   } catch {
