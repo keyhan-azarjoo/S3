@@ -129,6 +129,25 @@ function Has-Cmd($name){
   return [bool](Get-Command $name -ErrorAction SilentlyContinue)
 }
 
+function Get-ActiveDockerContext {
+  if (-not (Has-Cmd "docker")) {
+    return ""
+  }
+
+  try {
+    $ctx = (& docker context show 2>$null | Out-String).Trim()
+    if ($ctx) {
+      return $ctx
+    }
+  } catch {}
+
+  if ($env:DOCKER_CONTEXT) {
+    return $env:DOCKER_CONTEXT
+  }
+
+  return "default"
+}
+
 function Register-ResumeAfterReboot {
   try {
     $scriptPath = (Resolve-Path -Path $PSCommandPath).Path
