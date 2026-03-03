@@ -54,7 +54,7 @@ Script reference:
 
 `https://github.com/keyhan-azarjoo/S3/blob/main/windows/setup-storage.ps1`
 
-One-line run from GitHub (PowerShell):
+One-line run from GitHub (PowerShell, downloads companion modules automatically):
 
 ```powershell
 $script = Join-Path $env:TEMP 'setup-storage.ps1'
